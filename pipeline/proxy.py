@@ -200,12 +200,57 @@ def _is_openrouter_base_url(base_url: str) -> bool:
     return host == "openrouter.ai" or host.endswith(".openrouter.ai")
 
 
+class UnknownModelError(ValueError):
+    """Raised when a solver asks for a model outside the evaluation allowlist."""
+
+
+def _resolve_model(llm_config: dict, requested: str | None) -> dict:
+    """Pick the model entry to use, and its per-model routing fields.
+
+    The evaluation pins more than one model, and ``provider`` /
+    ``reasoning_effort`` differ per model — gpt-oss-120b runs at
+    ``reasoning_effort = low`` while gemma has reasoning disabled — so they
+    cannot be read from the flat ``llm.*`` keys once a solver selects a
+    model. ``llm.models`` is the allowlist; the flat keys stay as the
+    default so an existing config without ``models`` behaves unchanged.
+
+    A solver may only name a model on the allowlist: an unpinned model
+    would break the reproducibility the evaluation depends on.
+    """
+    default = {
+        "model": llm_config["model"],
+        "provider": llm_config.get("provider"),
+        "reasoning_effort": llm_config.get("reasoning_effort"),
+    }
+    entries = llm_config.get("models")
+    if not isinstance(entries, list) or not entries:
+        if requested is not None and requested != default["model"]:
+            raise UnknownModelError(requested)
+        return default
+    if requested is None:
+        for entry in entries:
+            if isinstance(entry, dict) and entry.get("model") == default["model"]:
+                return {**default, **entry}
+        return default
+    for entry in entries:
+        if isinstance(entry, dict) and entry.get("model") == requested:
+            # reasoning_effort is absent for models with reasoning disabled;
+            # falling back to the default's effort would silently re-enable it.
+            return {
+                "model": requested,
+                "provider": entry.get("provider", default["provider"]),
+                "reasoning_effort": entry.get("reasoning_effort"),
+            }
+    raise UnknownModelError(requested)
+
+
 def _call_llm(
     prompt: str,
     config: dict,
     *,
     max_seconds: float | None = None,
     stream_chunk_hook: Callable[[str, str], None] | None = None,
+    model: str | None = None,
 ) -> dict:
     """Call the LLM via the OpenAI SDK and return the response.
 
@@ -285,17 +330,19 @@ def _call_llm(
     # Kimi / GLM / Minimax / api.openai.com would at best be silently ignored
     # and at worst 4xx — neither outcome matches the commit-message promise
     # that the same proxy talks to any OpenAI-compatible endpoint.
+    chosen = _resolve_model(llm_config, model)
+
     extra_body: dict[str, Any] = {}
     if _is_openrouter_base_url(base_url):
-        if llm_config.get("provider"):
-            extra_body["provider"] = {"order": [llm_config["provider"]]}
-        if llm_config.get("reasoning_effort"):
-            extra_body["reasoning"] = {"effort": llm_config["reasoning_effort"]}
+        if chosen.get("provider"):
+            extra_body["provider"] = {"order": [chosen["provider"]]}
+        if chosen.get("reasoning_effort"):
+            extra_body["reasoning"] = {"effort": chosen["reasoning_effort"]}
 
     client = OpenAI(api_key=api_key, base_url=base_url, timeout=http_timeout)
 
     kwargs: dict[str, Any] = {
-        "model": llm_config["model"],
+        "model": chosen["model"],
         "messages": [{"role": "user", "content": prompt}],
         "max_tokens": llm_config["max_output_tokens"],
         "temperature": llm_config["temperature"],
@@ -1033,10 +1080,26 @@ def run_solver(
                         "text": text,
                     })
 
-                response = _call_llm(
-                    filled_prompt, config, max_seconds=remaining,
-                    stream_chunk_hook=_llm_chunk if trace_hook is not None else None,
-                )
+                # A solver may pick any model on the evaluation allowlist
+                # (``llm.models``); omitting the field keeps the default.
+                # An unpinned model is refused rather than silently served —
+                # reproducibility depends on the pin.
+                try:
+                    response = _call_llm(
+                        filled_prompt, config, max_seconds=remaining,
+                        stream_chunk_hook=_llm_chunk if trace_hook is not None else None,
+                        model=msg.get("model"),
+                    )
+                except UnknownModelError as exc:
+                    allowed = [
+                        e.get("model")
+                        for e in (config["llm"].get("models") or [])
+                        if isinstance(e, dict)
+                    ] or [config["llm"]["model"]]
+                    response = {
+                        "error": f"model {exc.args[0]!r} is not on the evaluation allowlist",
+                        "allowed_models": allowed,
+                    }
 
                 elapsed = time.time() - t0
                 _trace({

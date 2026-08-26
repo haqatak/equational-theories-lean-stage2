@@ -71,8 +71,14 @@ archive/
 # In-progress eval set held back from public release.
 examples/problems/final_evaluation/
 
+# Community-submitted solvers (local-only, not for public repo)
+examples/solo/community/
+
 # Playground (held back from initial public release)
 playground/
 scripts/playground_server.py
 scripts/run_job.py
 scripts/build_equation_index.py
+
+# Stage 1 leaderboard cheatsheets — local-only reference, not for public repo.
+stage1_cheetsheets/

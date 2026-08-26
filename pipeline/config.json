@@ -21,8 +21,19 @@
     "provider": "deepinfra/bf16",
     "max_output_tokens": 65536,
     "temperature": 0.0,
-    "reasoning_effort": "medium",
+    "reasoning_effort": "low",
     "use_seed": true,
-    "seed": 0
+    "seed": 0,
+    "models": [
+      {
+        "model": "openai/gpt-oss-120b",
+        "provider": "deepinfra/bf16",
+        "reasoning_effort": "low"
+      },
+      {
+        "model": "google/gemma-4-31b-it",
+        "provider": "deepinfra/bf16"
+      }
+    ]
   }
 }

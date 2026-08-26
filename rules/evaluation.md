@@ -116,7 +116,16 @@ Leaderboard eligibility requires a single self-contained `solver.py` (≤ 500 KB
 
 ## Proof Policy
 
-Proofs are verified with **Lean 4.32.2** and the matching **Mathlib 4.32.2** release.
+Proofs are verified with **Lean 4.33.1** and the matching **Mathlib 4.33.1** release
+(Mathlib commit `0df444a360eaa60ab8c11dca51a86af692955474`). The official Linux toolchain
+links **GMP 6.3.0**; this is pinned because arbitrary-precision arithmetic is part of the
+kernel's trusted base, and an older GMP is not equivalent even under the same Lean version.
+
+**Version changeover.** Evaluation moved to this toolchain on 2026-08-26 (UTC), from
+Lean 4.32.2 / Mathlib `905b95818eb32af7874a58b427f50c1711a5e96c`. Verdicts issued before that
+date were produced under the previous toolchain and remain valid: the change was an upstream
+kernel-hardening release, so it can only reject proofs that were never sound, never invalidate
+a proof that was. Any submission may be re-verified under the current toolchain on request.
 
 Submitted proofs are checked against a dependency policy:
 

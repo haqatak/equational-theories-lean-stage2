@@ -88,7 +88,7 @@ python3 -m pipeline.runner \
 
 - **OS**: macOS (Apple Silicon / Intel) or Linux (x86_64). Windows
   users should run under WSL 2 — the setup targets POSIX shells.
-- **Disk**: ~12 GB free — measured at Lean 4.32.2: the toolchain is
+- **Disk**: ~12 GB free — measured at Lean 4.33.1: the toolchain is
   ~2.6 GB and `.lake/` (dominated by the Mathlib olean cache) is
   ~7.5 GB, plus transient space while `lake exe cache get` unpacks.
   This repo is a self-contained lake package depending only on

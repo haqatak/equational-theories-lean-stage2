@@ -29,6 +29,20 @@
       "expected_error_code": "ACCEPTED"
     },
     {
+      "name": "accepted_true_at_cap",
+      "problem_path": "tests/fixtures/problems/p_true_basic.json",
+      "answer_path": "tests/fixtures/answers/accepted_true_at_cap.answer.json",
+      "expected_status": "accepted",
+      "expected_error_code": "ACCEPTED"
+    },
+    {
+      "name": "accepted_false_at_cap",
+      "problem_path": "tests/fixtures/problems/p_false_witness.json",
+      "answer_path": "tests/fixtures/answers/accepted_false_at_cap.answer.json",
+      "expected_status": "accepted",
+      "expected_error_code": "ACCEPTED"
+    },
+    {
       "name": "unparsed_invalid_json",
       "problem_path": "tests/fixtures/problems/p_true_basic.json",
       "answer_path": "tests/fixtures/answers/unparsed_invalid_json.answer.txt",

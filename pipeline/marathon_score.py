@@ -16,7 +16,9 @@ solver finished cleanly or was killed at the budget).
 """
 from __future__ import annotations
 
+import copy
 import json
+import os
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -26,11 +28,53 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT))
 
 from judge.verify import (  # noqa: E402
+    DEFAULT_ARTIFACT_DIR,
+    DEFAULT_LAKE,
+    DEFAULT_LEAN,
     JudgeConfig,
     JudgeConfigurationError,
     JudgeInfrastructureError,
     verify_answer,
 )
+
+PIPELINE_CONFIG_PATH = REPO_ROOT / "pipeline" / "config.json"
+
+
+def _default_judge_config() -> JudgeConfig:
+    """Judge config used when the caller supplies none.
+
+    Mirrors the Solo path (``pipeline.proxy._call_judge``): binaries and
+    artifact dir resolve from the environment, while the three caps —
+    ``lean_timeout_seconds`` / ``max_code_length`` / ``max_false_cert_bytes``
+    — come from ``pipeline/config.json``'s ``judge`` section, so Marathon
+    enforces the same documented reference limits as Solo (100 KB code,
+    20 KB false cert, 300 s Lean). Previously a ``None`` config fell through
+    to ``judge.verify``'s raw defaults, silently rejecting certificates the
+    published contract allows.
+
+    A missing or unreadable config is an organizer-side problem and raises
+    ``JudgeConfigurationError`` (infra-class, never a contestant verdict)
+    rather than silently regressing to library defaults.
+    """
+    try:
+        judge_cfg = json.loads(PIPELINE_CONFIG_PATH.read_text(encoding="utf-8"))["judge"]
+        caps = {
+            "lean_timeout_seconds": max(1, int(judge_cfg["lean_timeout_seconds"])),
+            "max_code_length": int(judge_cfg["max_code_length"]),
+            "max_false_cert_bytes": int(judge_cfg["max_false_cert_bytes"]),
+        }
+    except (OSError, ValueError, KeyError, TypeError) as exc:
+        raise JudgeConfigurationError(
+            f"cannot read judge caps from {PIPELINE_CONFIG_PATH}: {exc}"
+        ) from exc
+    return JudgeConfig(
+        lean_bin=Path(os.environ.get("LEAN_BIN", str(DEFAULT_LEAN))).expanduser(),
+        lake_bin=Path(os.environ.get("LAKE_BIN", str(DEFAULT_LAKE))).expanduser(),
+        artifact_dir=Path(
+            os.environ.get("JUDGE_ARTIFACT_DIR", str(DEFAULT_ARTIFACT_DIR))
+        ).expanduser(),
+        **caps,
+    )
 
 
 # Public five-status set from CLAUDE.md.
@@ -142,17 +186,42 @@ def _load_last_writes(output_path: Path) -> dict[str, dict]:
     return last
 
 
-def _to_judge_problem(problem: dict) -> dict:
-    """Same shape as ``pipeline.proxy._to_judge_problem`` — we duplicate
-    here so the score module is independent of the proxy import chain."""
+def _default_proof_policy() -> dict:
+    """Resolve the default axiom/declaration allowlist (the proof policy).
+
+    This is the third grading input, alongside the manifest and the size
+    caps — and like them it must be snapshotted BEFORE the solver launches.
+    The value lives in ``pipeline.proxy.DEFAULT_PROOF_POLICY``; that module
+    is imported lazily (at scoring time, after the solver exits) unless a
+    caller resolves it early. Under ``sandbox.mode=none`` a marathon solver
+    has filesystem write access, so a lazy import at scoring would recompile
+    a solver-rewritten ``pipeline/proxy.py`` and let the solver loosen its
+    own allowlist (banned axiom/declaration → ``accepted``). The runner
+    therefore calls this pre-launch and threads the snapshot through
+    ``score_marathon``; the deep copy freezes it against later mutation.
+    Score-only / external callers that pass nothing get a fresh read here.
+    """
     from pipeline.proxy import DEFAULT_PROOF_POLICY  # local to avoid OpenAI dep at import time
+    return copy.deepcopy(DEFAULT_PROOF_POLICY)
+
+
+def _to_judge_problem(problem: dict, default_proof_policy: dict | None = None) -> dict:
+    """Same shape as ``pipeline.proxy._to_judge_problem`` — we duplicate
+    here so the score module is independent of the proxy import chain.
+
+    ``default_proof_policy`` is the pre-launch snapshot (see
+    ``_default_proof_policy``); when omitted it is resolved fresh, which is
+    only safe for callers with no solver-tamper window (score-only tooling).
+    """
+    if default_proof_policy is None:
+        default_proof_policy = _default_proof_policy()
     return {
         "id": problem["id"],
         "eq1_id": problem["eq1_id"],
         "eq2_id": problem["eq2_id"],
         "equation1": problem["equation1"],
         "equation2": problem["equation2"],
-        "proof_policy": problem.get("proof_policy") or DEFAULT_PROOF_POLICY,
+        "proof_policy": problem.get("proof_policy") or default_proof_policy,
     }
 
 
@@ -160,6 +229,7 @@ def _grade_one(
     problem: dict,
     submission: dict,
     judge_config: JudgeConfig | None,
+    default_proof_policy: dict | None = None,
 ) -> PerProblemResult:
     pid = problem["id"]
     verdict = submission.get("verdict")
@@ -170,7 +240,7 @@ def _grade_one(
             message="solver output line missing 'verdict' or 'code' string fields",
         )
     raw_answer = json.dumps({"verdict": verdict, "code": code})
-    judge_problem = _to_judge_problem(problem)
+    judge_problem = _to_judge_problem(problem, default_proof_policy)
     try:
         result = verify_answer(judge_problem, raw_answer, config=judge_config)
     except JudgeInfrastructureError as exc:
@@ -195,6 +265,7 @@ def score_marathon(
     manifest_path: str | Path | None = None,
     output_path: str | Path,
     judge_config: JudgeConfig | None = None,
+    default_proof_policy: dict | None = None,
     wall_seconds: float | None = None,
     sigterm_fired: bool = False,
     sigkill_fired: bool = False,
@@ -210,6 +281,13 @@ def score_marathon(
     tamper-resistant scoring path. ``manifest_path`` remains supported for
     score-only invocations or external tooling, but the runner-fed snapshot
     takes precedence when both are supplied.
+
+    ``judge_config`` and ``default_proof_policy`` are the other two
+    tamper-resistant grading inputs: the runner resolves both pre-launch and
+    passes them here so scoring never re-reads ``pipeline/config.json`` or
+    ``pipeline/proxy.py`` off disk after a solver could have rewritten them.
+    When omitted they are resolved fresh — correct only for callers with no
+    solver-tamper window (e.g. ``--score-only``).
     """
     output_path = Path(output_path)
     if manifest_problems is not None:
@@ -219,6 +297,17 @@ def score_marathon(
     else:
         raise ValueError(
             "score_marathon: must supply either manifest_problems or manifest_path"
+        )
+    if judge_config is None:
+        judge_config = _default_judge_config()
+    if default_proof_policy is None:
+        default_proof_policy = _default_proof_policy()
+    if log_stream is not None:
+        print(
+            f"[score] judge caps: max_code_length={judge_config.max_code_length} "
+            f"max_false_cert_bytes={judge_config.max_false_cert_bytes} "
+            f"lean_timeout_seconds={judge_config.lean_timeout_seconds}",
+            file=log_stream, flush=True,
         )
     last_writes = _load_last_writes(output_path)
 
@@ -243,7 +332,7 @@ def score_marathon(
             )
             continue
         summary.attempted += 1
-        per = _grade_one(prob, sub, judge_config)
+        per = _grade_one(prob, sub, judge_config, default_proof_policy)
         summary.per_problem.append(per)
         summary.by_status[per.status] = summary.by_status.get(per.status, 0) + 1
         if per.status == "accepted":

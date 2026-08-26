@@ -1,0 +1,4 @@
+{"id": "cap_true_ok", "index": 1, "difficulty": "normal", "eq1_id": 38, "eq2_id": 42, "equation1": "x ◇ x = x ◇ y", "equation2": "x ◇ y = x ◇ z", "answer": true}
+{"id": "cap_true_over", "index": 2, "difficulty": "normal", "eq1_id": 38, "eq2_id": 42, "equation1": "x ◇ x = x ◇ y", "equation2": "x ◇ y = x ◇ z", "answer": true}
+{"id": "cap_false_ok", "index": 3, "difficulty": "normal", "eq1_id": 649, "eq2_id": 2608, "equation1": "x = x ◇ (y ◇ ((z ◇ x) ◇ x))", "equation2": "x = (y ◇ ((z ◇ z) ◇ y)) ◇ w", "answer": false}
+{"id": "cap_false_over", "index": 4, "difficulty": "normal", "eq1_id": 649, "eq2_id": 2608, "equation1": "x = x ◇ (y ◇ ((z ◇ x) ◇ x))", "equation2": "x = (y ◇ ((z ◇ z) ◇ y)) ◇ w", "answer": false}

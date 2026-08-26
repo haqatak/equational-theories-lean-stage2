@@ -46,9 +46,15 @@ BANNED_PROOF_TOKENS = (
     "unsafeCast", "unsafeIO", "unsafePerformIO",
 )
 EQUATION_NAME_RE = re.compile(r"^Equation[0-9]+$")
-MAX_CODE_LENGTH = 50_000
-MAX_FALSE_CERT_BYTES = 10_000
-LEAN_TIMEOUT_SECONDS = 120
+# These defaults mirror the reference values in ``pipeline/config.json``
+# (``judge.max_code_length`` / ``judge.max_false_cert_bytes`` /
+# ``judge.lean_timeout_seconds``). Both evaluation tracks propagate the
+# config values explicitly (Solo via ``pipeline.proxy._call_judge``,
+# Marathon via ``pipeline.marathon_score``); the constants here exist so a
+# bare ``verify_answer(...)`` call enforces the same documented contract.
+MAX_CODE_LENGTH = 100_000
+MAX_FALSE_CERT_BYTES = 20_000
+LEAN_TIMEOUT_SECONDS = 300
 MANIFEST_WARNING_SUBSTRING = "manifest out of date: git revision of dependency 'mathlib' changed"
 # Lean 4.32 added the default-on ``linter.defProp``, which fires on every
 # ``def <name> : <Prop>``. The judge's own documented submission shape is
@@ -474,7 +480,22 @@ def _parse_answer_payload(
             "code must be a non-empty string",
             verdict=verdict,
         )
-    if len(code.encode("utf-8")) > max_code_length:
+    # ``json.loads`` accepts lone-surrogate escapes (e.g. "\ud83d") and yields a
+    # Python str that cannot be UTF-8 encoded. Every downstream step — the byte
+    # cap here, the false-cert byte cap, and writing Submission.lean — encodes
+    # to UTF-8, so an unguarded ``.encode`` raises UnicodeEncodeError and the
+    # answer escapes the five-status contract (in Marathon it aborts the whole
+    # batch). Such code is not valid Lean source text: reject it as malformed.
+    try:
+        code_bytes_len = len(code.encode("utf-8"))
+    except UnicodeEncodeError:
+        return None, _result(
+            "malformed",
+            "CODE_NOT_UTF8",
+            "code is not encodable as UTF-8 (contains unpaired surrogates)",
+            verdict=verdict,
+        )
+    if code_bytes_len > max_code_length:
         return None, _result(
             "malformed",
             "CODE_TOO_LONG",

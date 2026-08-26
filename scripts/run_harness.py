@@ -2895,7 +2895,9 @@ def run_judge_internal_cases() -> list[dict[str, Any]]:
 
     try:
         from judge.verify import _parse_answer_payload
-        diamonds = "◇" * 20_000
+        # `◇` is 3 UTF-8 bytes: sized so char count stays under the cap
+        # while byte count exceeds it, at any MAX_CODE_LENGTH.
+        diamonds = "◇" * (MAX_CODE_LENGTH // 3 + 1_000)
         code = f"theorem submission : True := by trivial -- {diamonds}"
         assert len(code) < MAX_CODE_LENGTH
         assert len(code.encode("utf-8")) > MAX_CODE_LENGTH

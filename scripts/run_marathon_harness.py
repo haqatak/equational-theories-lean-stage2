@@ -12,6 +12,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import copy
 import json
 import subprocess
 import sys
@@ -166,6 +167,290 @@ def _run_oversized_solver_case(case: dict) -> tuple[bool, list[str]]:
     return (not failures), failures
 
 
+def _run_size_cap_case(case: dict, lean_ok: bool) -> tuple[bool, list[str]]:
+    """Marathon scoring must enforce the documented judge size caps.
+
+    Regression for the config-propagation bug reported 2026-08-25: the
+    scoring path passed ``judge_config=None`` and ``verify_answer`` fell
+    back to ``judge.verify``'s raw defaults (then 50 KB / 10 KB), while the
+    published contract, ``rules/evaluation.md``, and the Solo path all
+    enforce ``pipeline/config.json``'s 100 KB / 20 KB. A 56 KB true
+    certificate — legal per the contract — was scored ``malformed``.
+
+    The case writes a synthetic answers.jsonl (no solver run) and scores it
+    through the default (``judge_config=None``) path:
+
+    * true cert at exactly ``max_code_length`` bytes  → accepted (Lean-gated;
+      never ``malformed`` even without Lean)
+    * true cert one byte over                          → malformed
+    * false cert at exactly ``max_false_cert_bytes``   → accepted (Lean-gated)
+    * false cert one byte over                         → malformed
+
+    It also pins the alignment that made the bug possible: the raw defaults
+    in ``judge.verify`` and the scoring default config must both equal the
+    ``pipeline/config.json`` reference values (100 KB / 20 KB / 300 s).
+    """
+    import judge.verify as _verify
+    from pipeline.marathon_score import _default_judge_config
+
+    failures: list[str] = []
+
+    cfg_path = ROOT / "pipeline" / "config.json"
+    judge_cfg = json.loads(cfg_path.read_text(encoding="utf-8"))["judge"]
+    cap_code = int(judge_cfg["max_code_length"])
+    cap_false = int(judge_cfg["max_false_cert_bytes"])
+    cap_lean = int(judge_cfg["lean_timeout_seconds"])
+
+    # The public contract values. A config edit that changes them must be a
+    # deliberate, harness-visible decision — same fence style as the Solo
+    # harness's `pipeline_config_cap_is_500000_bytes`.
+    if cap_code != 100_000:
+        failures.append(f"config judge.max_code_length={cap_code}, contract says 100000")
+    if cap_false != 20_000:
+        failures.append(f"config judge.max_false_cert_bytes={cap_false}, contract says 20000")
+
+    # Raw library defaults must not drift from the reference config again.
+    for name, expect in (
+        ("MAX_CODE_LENGTH", cap_code),
+        ("MAX_FALSE_CERT_BYTES", cap_false),
+        ("LEAN_TIMEOUT_SECONDS", cap_lean),
+    ):
+        actual = getattr(_verify, name)
+        if actual != expect:
+            failures.append(
+                f"judge.verify.{name}={actual} drifted from config.json value {expect}"
+            )
+
+    # The scoring default config must carry the config.json caps.
+    default_cfg = _default_judge_config()
+    if default_cfg.max_code_length != cap_code:
+        failures.append(
+            f"_default_judge_config().max_code_length={default_cfg.max_code_length} != {cap_code}"
+        )
+    if default_cfg.max_false_cert_bytes != cap_false:
+        failures.append(
+            f"_default_judge_config().max_false_cert_bytes={default_cfg.max_false_cert_bytes} != {cap_false}"
+        )
+    if default_cfg.lean_timeout_seconds != cap_lean:
+        failures.append(
+            f"_default_judge_config().lean_timeout_seconds={default_cfg.lean_timeout_seconds} != {cap_lean}"
+        )
+
+    def _pad_to(code: str, target_bytes: int) -> str:
+        prefix = "-- pad "
+        room = target_bytes - len(code.encode("utf-8")) - len(prefix) - 1
+        assert room >= 0, f"base cert already above {target_bytes} bytes"
+        padded = code + prefix + "x" * room + "\n"
+        assert len(padded.encode("utf-8")) == target_bytes
+        return padded
+
+    # Known-good certs for the fixture problems (cap_true_*: Eq38→Eq42,
+    # same as the Solo `accepted_true_basic` fixture; cap_false_*: the
+    # n=2 counterexample the `partial` fixture solver emits for 649→2608).
+    true_proof = (
+        "import JudgeProblem\n\n"
+        "def submission : Goal := by\n"
+        "  intro G _ h\n"
+        "  intro x y z\n"
+        "  rw [← h, h]\n"
+    )
+    false_cert = (
+        "import JudgeProblem\n"
+        "import JudgeDecide.DecideBang\n"
+        "import JudgeFinOp.MemoFinOp\n"
+        "open MemoFinOp\n\n"
+        "def submission : Goal := by\n"
+        "  let m : Magma (Fin 2) := {\n"
+        "    op := finOpTable \"[[0, 1], [0, 1]]\"\n"
+        "  }\n"
+        "  refine ⟨Fin 2, m, ?_⟩\n"
+        "  decideFin!\n"
+    )
+
+    answers = [
+        {"id": "cap_true_ok", "verdict": "true",
+         "code": _pad_to(true_proof, cap_code)},
+        {"id": "cap_true_over", "verdict": "true",
+         "code": _pad_to(true_proof, cap_code + 1)},
+        {"id": "cap_false_ok", "verdict": "false",
+         "code": _pad_to(false_cert, cap_false)},
+        {"id": "cap_false_over", "verdict": "false",
+         "code": _pad_to(false_cert, cap_false + 1)},
+    ]
+
+    with tempfile.TemporaryDirectory(prefix=f"marathon_{case['name']}_") as tmp:
+        output = Path(tmp) / "answers.jsonl"
+        with output.open("w", encoding="utf-8") as fh:
+            for entry in answers:
+                fh.write(json.dumps(entry) + "\n")
+        summary = score_marathon(
+            manifest_path=ROOT / case["manifest"],
+            output_path=output,
+        )
+
+    status = {r.id: r.status for r in summary.per_problem}
+    for pid in ("cap_true_over", "cap_false_over"):
+        if status.get(pid) != "malformed":
+            failures.append(f"{pid}: expected malformed, got {status.get(pid)!r}")
+    for pid in ("cap_true_ok", "cap_false_ok"):
+        # The load-bearing assertion: at-cap certs must clear the size gate.
+        # Without Lean they land as harness_error (infra), never malformed.
+        if status.get(pid) == "malformed":
+            failures.append(
+                f"{pid}: rejected as malformed at the documented cap — "
+                "judge caps not propagated from pipeline/config.json"
+            )
+        if lean_ok and status.get(pid) != "accepted":
+            failures.append(f"{pid}: expected accepted with Lean, got {status.get(pid)!r}")
+    if lean_ok and summary.score != 2:
+        failures.append(f"score={summary.score} expected=2")
+
+    # Tamper inertness: scoring runs after the solver exits, and the caps
+    # come from pipeline/config.json — a file a filesystem-visible solver
+    # could rewrite mid-run. The runner therefore snapshots the JudgeConfig
+    # pre-launch (``MarathonRunResult.judge_config``). Pin both halves:
+    # the default path is a live read of the file (which is why the
+    # snapshot exists), and an explicit snapshot beats the on-disk file.
+    import pipeline.marathon_score as _ms
+    real_path = _ms.PIPELINE_CONFIG_PATH
+    with tempfile.TemporaryDirectory(prefix="marathon_cfg_tamper_") as tmp:
+        cfg_all = json.loads(real_path.read_text(encoding="utf-8"))
+        cfg_all["judge"]["max_code_length"] = 10**9
+        cfg_all["judge"]["max_false_cert_bytes"] = 10**9
+        tampered = Path(tmp) / "config.json"
+        tampered.write_text(json.dumps(cfg_all), encoding="utf-8")
+        _ms.PIPELINE_CONFIG_PATH = tampered
+        try:
+            live = _default_judge_config()
+            if live.max_code_length != 10**9:
+                failures.append(
+                    "default judge config did not read the config file "
+                    f"(max_code_length={live.max_code_length}); tamper test is vacuous"
+                )
+            output = Path(tmp) / "answers.jsonl"
+            output.write_text(
+                json.dumps({
+                    "id": "cap_true_over", "verdict": "true",
+                    "code": _pad_to(true_proof, cap_code + 1),
+                }) + "\n",
+                encoding="utf-8",
+            )
+            tampered_summary = score_marathon(
+                manifest_path=ROOT / case["manifest"],
+                output_path=output,
+                judge_config=default_cfg,  # snapshot taken before the "tamper"
+            )
+        finally:
+            _ms.PIPELINE_CONFIG_PATH = real_path
+    t_status = {r.id: r.status for r in tampered_summary.per_problem}
+    if t_status.get("cap_true_over") != "malformed":
+        failures.append(
+            "config tampered after the snapshot changed the verdict: "
+            f"cap_true_over={t_status.get('cap_true_over')!r}, expected malformed"
+        )
+
+    return (not failures), failures
+
+
+def _run_proof_policy_tamper_case(case: dict, lean_ok: bool) -> tuple[bool, list[str]]:
+    """The axiom/declaration allowlist must be the pre-launch snapshot, not a
+    post-solver disk read.
+
+    Regression for the challenger's ``tamper`` finding: scoring lazily imported
+    ``pipeline.proxy.DEFAULT_PROOF_POLICY`` at grading time — after the solver
+    subprocess exited — so under ``sandbox.mode=none`` a solver could rewrite
+    ``pipeline/proxy.py`` mid-run to loosen its own allowlist (banned axiom or
+    declaration → ``accepted``). The fix snapshots the policy pre-launch
+    (``MarathonRunResult.proof_policy``) and threads it through
+    ``score_marathon``.
+
+    This is Lean-free: ``verify_answer`` is stubbed to capture the exact
+    ``proof_policy`` that reaches the judge, and ``_default_proof_policy`` is
+    monkeypatched to model a solver-rewritten (loosened) on-disk policy. We
+    then assert that the snapshot passed to ``score_marathon`` — not the
+    tampered disk value — is what governs grading.
+    """
+    import pipeline.marathon_score as ms
+    failures: list[str] = []
+
+    real_default = ms._default_proof_policy
+    real_verify = ms.verify_answer
+
+    # A trusted snapshot, resolved before any "tamper" (as the runner does).
+    trusted = real_default()
+    if not isinstance(trusted, dict) or "allowed_axioms" not in trusted:
+        return False, [f"_default_proof_policy() returned an unexpected shape: {trusted!r}"]
+    if "myCheatAxiom" in trusted.get("allowed_axioms", []):
+        return False, ["trusted policy already contains the sentinel axiom; test is vacuous"]
+
+    # Model the solver having rewritten pipeline/proxy.py to loosen the policy.
+    loosened = copy.deepcopy(trusted)
+    loosened["allowed_axioms"] = list(loosened["allowed_axioms"]) + ["myCheatAxiom"]
+
+    captured: list[dict] = []
+
+    def fake_verify(problem, raw_answer, config=None):
+        captured.append(problem.get("proof_policy"))
+        return {"status": "malformed", "error_code": "STUB", "message": ""}
+
+    with tempfile.TemporaryDirectory(prefix=f"marathon_{case['name']}_") as tmp:
+        output = Path(tmp) / "answers.jsonl"
+        output.write_text(
+            json.dumps({
+                "id": "cap_true_ok", "verdict": "true",
+                "code": "import JudgeProblem\ndef submission : Goal := by trivial\n",
+            }) + "\n",
+            encoding="utf-8",
+        )
+        ms.verify_answer = fake_verify
+        ms._default_proof_policy = lambda: copy.deepcopy(loosened)  # tampered disk
+        try:
+            # (a) With the trusted snapshot supplied, the judge must see the
+            #     STRICT policy — the tampered disk value is never consulted.
+            captured.clear()
+            ms.score_marathon(
+                manifest_path=ROOT / case["manifest"],
+                output_path=output,
+                default_proof_policy=trusted,
+            )
+            if not captured:
+                failures.append("no problem was graded under the trusted snapshot")
+            elif "myCheatAxiom" in (captured[0] or {}).get("allowed_axioms", []):
+                failures.append(
+                    "the tampered (loosened) policy reached the judge even though a "
+                    "trusted snapshot was supplied — snapshot not honored"
+                )
+
+            # (b) Sanity that (a) is not vacuous: the no-snapshot path DOES pick
+            #     up whatever _default_proof_policy() returns, so the two paths
+            #     genuinely differ and the snapshot is load-bearing.
+            captured.clear()
+            ms.score_marathon(
+                manifest_path=ROOT / case["manifest"],
+                output_path=output,
+                default_proof_policy=None,
+            )
+            if not captured or "myCheatAxiom" not in (captured[0] or {}).get("allowed_axioms", []):
+                failures.append(
+                    "no-snapshot path did not resolve the (patched) default policy; "
+                    "the snapshot vs fresh-resolve distinction is untested"
+                )
+        finally:
+            ms.verify_answer = real_verify
+            ms._default_proof_policy = real_default
+
+    # The snapshot must be a deep copy (freezing it against later mutation) and
+    # must match the real shipped allowlist.
+    from pipeline.proxy import DEFAULT_PROOF_POLICY
+    snap = real_default()
+    if snap is DEFAULT_PROOF_POLICY:
+        failures.append("_default_proof_policy() returned the live module dict, not a copy")
+    if snap != DEFAULT_PROOF_POLICY:
+        failures.append("_default_proof_policy() does not match pipeline.proxy.DEFAULT_PROOF_POLICY")
+
+    return (not failures), failures
+
+
 def _run_case(case: dict, lean_ok: bool) -> tuple[bool, list[str]]:
     """Execute one case; return (passed, failure_messages)."""
     import os as _os
@@ -179,6 +464,10 @@ def _run_case(case: dict, lean_ok: bool) -> tuple[bool, list[str]]:
         return _run_oversized_solver_case(case)
     if case.get("synthesize_oversized_manifest"):
         return _run_oversized_manifest_case(case)
+    if case.get("synthesize_size_cap_answers"):
+        return _run_size_cap_case(case, lean_ok)
+    if case.get("synthesize_proof_policy_tamper"):
+        return _run_proof_policy_tamper_case(case, lean_ok)
 
     submission = ROOT / case["submission_path"]
     manifest = ROOT / case["manifest"]
@@ -229,6 +518,8 @@ def _run_case(case: dict, lean_ok: bool) -> tuple[bool, list[str]]:
             summary = score_marathon(
                 manifest_path=manifest,
                 manifest_problems=run.manifest_problems,
+                judge_config=run.judge_config,
+                default_proof_policy=run.proof_policy,
                 output_path=output,
                 wall_seconds=run.wall_seconds,
                 sigterm_fired=run.sigterm_fired,
@@ -249,6 +540,15 @@ def _run_case(case: dict, lean_ok: bool) -> tuple[bool, list[str]]:
 
     def fail(msg: str):
         failures.append(msg)
+
+    # Universal invariant: every run must carry the pre-launch grading
+    # snapshots (see MarathonRunResult) so scoring never falls back to a
+    # post-run read of pipeline/config.json or pipeline/proxy.py — a solver
+    # with filesystem access could have rewritten either mid-run.
+    if last_run is not None and last_run.judge_config is None:
+        fail("runner did not snapshot judge_config before launching the solver")
+    if last_run is not None and not last_run.proof_policy:
+        fail("runner did not snapshot proof_policy before launching the solver")
 
     if "exit_code_in" in a and last_run is not None:
         if last_run.exit_code not in a["exit_code_in"]:

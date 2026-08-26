@@ -39,6 +39,7 @@ Solo-depth attempt on every problem and must triage.
 | Concurrency        | Solver-controlled                      | Runner only enforces the two budgets.                              |
 | Manifest source    | `examples/problems/marathon/normal_100.jsonl` | Frozen 100-problem slice of `normal.jsonl`; no shuffle for MVP. |
 | Hard kill          | SIGTERM at budget, SIGKILL 5 s later   | Output JSONL frozen at SIGTERM time.                               |
+| Judge size caps    | **100 KB** Lean code / **20 KB** false cert (UTF-8 bytes) | Same values as Solo, propagated into scoring from `pipeline/config.json` (`judge.max_code_length` / `judge.max_false_cert_bytes`); Lean runs under `judge.lean_timeout_seconds` (300 s) per certificate. |
 
 Why 5 minutes: triage must be load-bearing. If the per-problem
 allowance matched Solo's 3600 s, a sequential solver could plausibly
@@ -136,6 +137,7 @@ with shape-appropriate mechanisms:
 | Network exfil / unmetered LLM   | Real upstream keys (`OPENROUTER_API_KEY` etc.) are **not** in the solver env. The runner starts a local HTTP proxy on `127.0.0.1:<random>` and sets `OPENAI_BASE_URL` / `OPENAI_API_KEY` (per-run secret) to point the solver there. The proxy holds the upstream credentials. |
 | Token budget bypass             | The proxy itself is the authoritative source of truth for the running total — held in process memory under `threading.Lock`, advanced by the proxy as it observes upstream `usage`. The runner watchdog reads it via the proxy handle, never via a file the solver could touch. The proxy refuses (HTTP 402) once `BUDGET_TOKENS` is reached, including pessimistic char-based fallback when no upstream `usage` is returned. A solver writing its own `tokens_used.txt` has no effect (`token_tamper_inert` regression). |
 | Manifest mutation               | Runner snapshots the manifest in memory before launching, hands the solver a writable copy under scratch, and scores against the snapshot. Overwriting the on-disk manifest does not affect scoring. |
+| Judge-cap mutation              | The scoring caps live in `pipeline/config.json`, which scoring reads *after* the solver exits — so the runner resolves the `JudgeConfig` **before** launch and scoring uses that snapshot (`MarathonRunResult.judge_config`, `size_caps_scoring` regression). Rewriting the config mid-run does not raise a solver's own limits. |
 | Wall-clock evasion / fork-bomb  | Solver runs in its own session/process group (`start_new_session=True`); SIGTERM at budget and SIGKILL after 5 s grace reach descendants too. |
 | Cross-run persistence           | Scratch dir is wiped at run start (verified by `anti_persist` harness case).                          |
 | Output replay / late writes     | Output JSONL read **once** at end; late writes may land on disk but are graded last-write-wins and the timing watchdog has already cut. |
@@ -231,6 +233,10 @@ Determinism / replay:
 Key isolation:
 
 21. `key_isolation` — solver env probe: confirms raw upstream keys are absent and `OPENAI_BASE_URL` is loopback.
+
+Judge caps:
+
+22. `size_caps_scoring` — scoring enforces the documented judge size caps from `pipeline/config.json` (at-cap certs clear the size gate and verify; one-byte-over certs are `malformed`); the raw defaults in `judge.verify` may not drift from the config reference values; and a config rewrite after the pre-launch snapshot cannot change a verdict. Every other case additionally asserts the runner produced the snapshot.
 
 When the harness exits 0 every documented marathon behaviour is covered.
 

@@ -314,6 +314,22 @@
         "exit_code_in": [0],
         "key_isolation_holds": true
       }
+    },
+    {
+      "name": "size_caps_scoring",
+      "synthesize_size_cap_answers": true,
+      "manifest": "tests/marathon_fixtures/manifests/size_caps_4.jsonl",
+      "assertions": {
+        "documented_caps_enforced": true
+      }
+    },
+    {
+      "name": "proof_policy_tamper_inert",
+      "synthesize_proof_policy_tamper": true,
+      "manifest": "tests/marathon_fixtures/manifests/size_caps_4.jsonl",
+      "assertions": {
+        "policy_snapshot_honored": true
+      }
     }
   ]
 }

@@ -8,6 +8,14 @@
       "expected_error_code": "DUPLICATE_JSON_KEYS"
     },
     {
+      "name": "r8_lone_surrogate_code",
+      "problem_path": "tests/fixtures/problems/p_true_basic.json",
+      "answer_path": "tests/challenger/answers/r8_lone_surrogate_code.answer.json",
+      "expected_status": "malformed",
+      "expected_error_code": "CODE_NOT_UTF8",
+      "notes": "R8: a JSON lone-surrogate escape in `code` decodes to a str that cannot be UTF-8 encoded; the byte-cap check must reject it as malformed, not raise UnicodeEncodeError out of verify_answer (which would escape the five-status contract and, in Marathon, abort the whole batch)."
+    },
+    {
       "name": "wrapped_disallowed_theorem_reference",
       "problem_path": "tests/fixtures/problems/p_true_decl_policy.json",
       "answer_path": "tests/challenger/answers/wrapped_disallowed_theorem_reference.answer.json",

@@ -38,6 +38,7 @@ import sys
 import threading
 import time
 from dataclasses import dataclass
+from typing import Any
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -90,6 +91,19 @@ class MarathonRunResult:
     # disk, so a solver that overwrites JUDGE_MARATHON_MANIFEST cannot
     # poison the score path.
     manifest_problems: tuple[dict, ...] = ()
+    # Judge scoring config (size caps, Lean timeout) resolved from
+    # pipeline/config.json before the solver launched — same trust
+    # rationale as ``manifest_problems``: a solver with filesystem access
+    # must not be able to raise its own limits by rewriting the config
+    # mid-run. ``judge.verify.JudgeConfig`` (typed loosely to keep this
+    # module's import graph light).
+    judge_config: Any = None
+    # The axiom/declaration allowlist (proof policy), resolved from
+    # pipeline/proxy.py before launch for the same reason: it is imported
+    # lazily at scoring time, so without a pre-launch snapshot a solver
+    # could rewrite pipeline/proxy.py mid-run to loosen its own allowlist
+    # (banned axiom/declaration → accepted). A deep-copied dict snapshot.
+    proof_policy: Any = None
 
 
 def _validate_solver_layout(submission_dir: Path) -> str | None:
@@ -304,6 +318,18 @@ def run_marathon(
     manifest_problems = _load_manifest_snapshot(manifest_path)
     solver_manifest_path = scratch_dir / "manifest.jsonl"
     _write_manifest_copy(manifest_problems, solver_manifest_path)
+
+    # Resolve the judge scoring config (size caps from pipeline/config.json,
+    # Lean timeout) AND the proof policy (axiom/declaration allowlist from
+    # pipeline/proxy.py) BEFORE the solver runs — same trust rationale as the
+    # manifest snapshot: scoring happens after the solver exits, and a
+    # solver with filesystem access must not be able to raise its own
+    # limits or loosen its own allowlist by rewriting those files mid-run.
+    # A broken config raises here, pre-launch, as an infra failure instead
+    # of burning the solver budget.
+    from pipeline.marathon_score import _default_judge_config, _default_proof_policy
+    judge_config = _default_judge_config()
+    proof_policy = _default_proof_policy()
 
     # Start the local LLM proxy (if requested and an upstream key is
     # available). The proxy holds the upstream credentials so the solver
@@ -606,4 +632,6 @@ def run_marathon(
         budget_seconds=budget_seconds,
         budget_tokens=budget_tokens,
         manifest_problems=manifest_problems,
+        judge_config=judge_config,
+        proof_policy=proof_policy,
     )

@@ -146,6 +146,11 @@ def main() -> int:
         summary = score_marathon(
             manifest_path=manifest_path,
             manifest_problems=(run_result.manifest_problems if run_result else None),
+            # Pre-launch snapshots of the judge caps and proof policy (see
+            # MarathonRunResult); --score-only has no tamper window and
+            # resolves both fresh.
+            judge_config=(run_result.judge_config if run_result else None),
+            default_proof_policy=(run_result.proof_policy if run_result else None),
             output_path=paths["output"],
             wall_seconds=(run_result.wall_seconds if run_result else None),
             sigterm_fired=(run_result.sigterm_fired if run_result else False),

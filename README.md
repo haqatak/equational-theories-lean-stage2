@@ -661,9 +661,9 @@ The judge is deterministic: same input always produces same output.
 
 | Constraint | Value |
 |------------|-------|
-| Max code length | 100,000 characters |
+| Max code length | 100,000 bytes (UTF-8) |
 | Max false certificate code | 20,000 bytes |
-| Lean timeout | 300 seconds per proof |
+| Lean timeout | 300 seconds per Lean phase — see below |
 | Banned tokens | `sorry`, `admit`, `sorryAx`, `dbg_trace`, `dbgTrace`, `run_tac`, `mkSorry`, `initialize`, `builtin_initialize` |
 
 ### Available Imports
@@ -754,7 +754,7 @@ There are **two routing styles**, both work end-to-end:
 | `LAKE_BIN` | auto-detected | Path to the `lake` binary |
 | `JUDGE_ARTIFACT_DIR` | `.artifacts` | Where per-verify `JudgeProblem.lean`, `Submission.lean`, and `Problem.lean` are written |
 | `JUDGE_LEAN_PATH` | (none; falls back to `lake env`) | Operator override for `LEAN_PATH` — useful when `.lake/` is read-only and `lake env` can't recompute |
-| `LEAN_TIMEOUT_SECONDS` | `300` (raw `judge/verify.py` default, matching `judge.lean_timeout_seconds` in `pipeline/config.json`) | Per-proof compilation timeout. The raw default now equals the reference config value, so a bare `judge/verify.py` call and the pipeline both time out at 300 s; set this to override. |
+| `LEAN_TIMEOUT_SECONDS` | `300` (raw `judge/verify.py` default, matching `judge.lean_timeout_seconds` in `pipeline/config.json`) | Applied **independently to each of the two contestant-dependent Lean phases** (compiling `Submission.lean`, then running `Problem.lean`), not as one aggregate deadline for the judge call. The raw default now equals the reference config value, so a bare `judge/verify.py` call and the pipeline both time out at 300 s; set this to override. |
 | `OPENAI_API_KEY` | (none) | Preferred API key for LLM calls — OpenAI SDK reads it first |
 | `OPENROUTER_API_KEY` | (none) | Fallback key if `OPENAI_API_KEY` is unset; same wire format |
 | `OPENAI_BASE_URL` | `https://openrouter.ai/api/v1` | Env-level base URL; overridden by `llm.base_url` in the config |

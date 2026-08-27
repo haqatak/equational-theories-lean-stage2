@@ -91,7 +91,24 @@ or
 - **True certificate**: a Lean 4 proof that the hypothesis equation implies the goal equation.
 - **False certificate**: a Lean 4 proof that there exists a magma satisfying the hypothesis but not the goal. The carrier may be finite (e.g. an explicit operation table on `Fin n`) or infinite (e.g. `Nat` or a submission-defined inductive type) — the judge's goal is `∃ (G : Type) (_ : Magma G), EquationLHS G ∧ ¬ EquationRHS G`, with no finiteness constraint.
 
-Both are verified by the deterministic Lean judge. The judge returns exactly one of the following statuses:
+Both are verified by the deterministic Lean judge.
+
+**Lean timeout.** A judge call runs Lean in three steps. `judge.lean_timeout_seconds`
+(300 s) is applied **independently to each of the two steps that check contestant-supplied
+proof terms** — it is not one aggregate deadline for the whole call:
+
+| Step | Bounded by 300 s | Depends on the submission |
+|---|---|---|
+| Compile the judge-generated `JudgeProblem.lean` (equation definitions and the `Goal` abbrev) | no | no |
+| Compile `Submission.lean` — elaborates and kernel-checks the submitted certificate | **yes** | yes |
+| Run `Problem.lean` — binds the submitted term to `theorem _judge_checked_<nonce> : Goal`, which re-checks it | **yes** | yes |
+
+Two independent limits reflect that structure: both bounded steps check the submission, at
+different stages, and their relative cost is not something a contestant can observe or control.
+A single aggregate deadline would make that split part of the verdict. Judge-controlled
+preparation is excluded from the contestant's budget.
+
+The judge returns exactly one of the following statuses:
 
 | Status | Meaning |
 |--------|---------|

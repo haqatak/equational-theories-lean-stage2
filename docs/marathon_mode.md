@@ -39,7 +39,7 @@ Solo-depth attempt on every problem and must triage.
 | Concurrency        | Solver-controlled                      | Runner only enforces the two budgets.                              |
 | Manifest source    | `examples/problems/marathon/normal_100.jsonl` | Frozen 100-problem slice of `normal.jsonl`; no shuffle for MVP. |
 | Hard kill          | SIGTERM at budget, SIGKILL 5 s later   | Output JSONL frozen at SIGTERM time.                               |
-| Judge size caps    | **100 KB** Lean code / **20 KB** false cert (UTF-8 bytes) | Same values as Solo, propagated into scoring from `pipeline/config.json` (`judge.max_code_length` / `judge.max_false_cert_bytes`); Lean runs under `judge.lean_timeout_seconds` (300 s) per certificate. |
+| Judge size caps    | **100 KB** Lean code / **20 KB** false cert (UTF-8 bytes) | Same values as Solo, propagated into scoring from `pipeline/config.json` (`judge.max_code_length` / `judge.max_false_cert_bytes`); Lean runs under `judge.lean_timeout_seconds` (300 s) per Lean phase, applied independently to compiling `Submission.lean` and to running `Problem.lean`. |
 
 Why 5 minutes: triage must be load-bearing. If the per-problem
 allowance matched Solo's 3600 s, a sequential solver could plausibly

@@ -1,0 +1,14 @@
+[
+  {"id": "normal_0749", "eq1_id": 0, "eq2_id": 0,
+   "equation1": "x = y ◇ (x ◇ ((z ◇ w) ◇ w))",
+   "equation2": "x = ((x ◇ x) ◇ x) ◇ (x ◇ x)"},
+  {"id": "normal_0260", "eq1_id": 0, "eq2_id": 0,
+   "equation1": "x = (y ◇ z) ◇ ((w ◇ x) ◇ z)",
+   "equation2": "x ◇ x = (y ◇ z) ◇ (x ◇ y)"},
+  {"id": "normal_0227", "eq1_id": 0, "eq2_id": 0,
+   "equation1": "x = (y ◇ (z ◇ (x ◇ w))) ◇ y",
+   "equation2": "x = y ◇ ((y ◇ (z ◇ z)) ◇ z)"},
+  {"id": "normal_0092", "eq1_id": 0, "eq2_id": 0,
+   "equation1": "x = (y ◇ ((z ◇ x) ◇ w)) ◇ z",
+   "equation2": "x = x ◇ (y ◇ (y ◇ (z ◇ z)))"}
+]

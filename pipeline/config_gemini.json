@@ -1,0 +1,27 @@
+{
+  "solver": {
+    "timeout_seconds": 3600
+  },
+  "sandbox": {
+    "mode": "none",
+    "image": "ee-solver:latest",
+    "memory_mb": 2048,
+    "cpus": 2,
+    "pids_limit": 64,
+    "tmpfs_size_mb": 64
+  },
+  "judge": {
+    "lean_timeout_seconds": 300,
+    "max_code_length": 100000,
+    "max_false_cert_bytes": 20000,
+    "max_solver_bytes": 500000
+  },
+  "llm": {
+    "model": "gemini-2.5-pro",
+    "base_url": "https://generativelanguage.googleapis.com/v1beta/openai/",
+    "api_key_env": "GEMINI_API_KEY",
+    "max_output_tokens": 65536,
+    "temperature": 0.0,
+    "use_seed": false
+  }
+}

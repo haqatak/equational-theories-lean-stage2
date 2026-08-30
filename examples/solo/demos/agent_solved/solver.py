@@ -23,9 +23,13 @@ from __future__ import annotations
 
 import itertools
 import json
+import multiprocessing as mp
+import os
 import random
+import signal
 import sys
 import time
+import resource
 from typing import Dict, List, Optional, Tuple
 
 # ══════════════════════════════════════════════════════════════
@@ -275,8 +279,13 @@ def models_of(lhs1, rhs1, n, sample=0, cap=600, seed=0, deadline=float("inf")):
     return out
 
 
-def refute(prob: Problem, deadline=float("inf"), sizes=(2, 3), sample4=0):
-    """Return (n, table) with eq1 holding and eq2 failing, or None."""
+def refute(prob: Problem, deadline=float("inf"), sizes=(2, 3), sample4=0, sat=True,
+           sat_sizes=(4, 5, 6, 7, 8)):
+    """Return (n, table) with eq1 holding and eq2 failing, or None.
+
+    ``sizes`` are enumerated model sizes (n=2,3 enumeration is cheap);
+    ``sample4`` enables sampled n=4 search; ``sat`` enables the SAT fallback;
+    ``sat_sizes`` limits which sizes the SAT phase may try."""
     plans = [(n, 0) for n in sizes]
     if sample4:
         plans.append((4, sample4))
@@ -293,8 +302,10 @@ def refute(prob: Problem, deadline=float("inf"), sizes=(2, 3), sample4=0):
                 return None
             if fails(T, P2) is not None:
                 return (n, T)
-    # No model up to size 3: SAT search for n≥4 (the hard cases).
-    sizes_left = [n for n in range(4, 9) if time.time() < deadline]
+    if not sat:
+        return None
+    # No model up to the enumerated sizes: SAT search for n≥4 (the hard cases).
+    sizes_left = [n for n in sat_sizes if time.time() < deadline]
     budget_per = (deadline - time.time()) / max(len(sizes_left), 1)
     for n in sizes_left:
         size_deadline = time.time() + budget_per
@@ -322,6 +333,16 @@ class _TN:
         self.pos = pos; self.l = l; self.r = r
 
 
+_SAT_MAX_CLAUSES = 2_000_000  # rough clause-count guard (see _sat_witness)
+# Hard address-space cap (bytes) for the forked SAT child. pycosat.solve is a
+# blocking C call that can run away to >130GB on a hard UNSAT instance and crash
+# the whole process with a bus error/segfault. We cannot interrupt it from Python,
+# so we run it in a forked child and let the OS kill it if it exceeds this cap.
+# Anything above the cap is treated as "no witness at this size".
+_SAT_MEM_CAP = 6 * 1024 ** 3  # ~6 GB
+
+
+
 try:
     import pycosat
     HAVE_PYCOSAT = True
@@ -329,16 +350,13 @@ except Exception:
     HAVE_PYCOSAT = False
 
 
-def _sat_witness(lhs1, rhs1, lhs2, rhs2, n, eq1_vars, eq2_vars, deadline=float("inf")):
-    """One size-n magma (flat row-major list) with eq1 universally true & eq2 false, else None.
+def _sat_solve_body(lhs1, rhs1, lhs2, rhs2, n, eq1_vars, eq2_vars, deadline):
+    """Build the size-n SAT instance and search for a counter-model witness.
 
-    ``deadline`` bounds the search: a single UNSAT size can take ~70s, so we bail out
-    if the total elapsed time crosses it. Returns a *flat* list of length n*n.
+    Returns a flat row-major witness list, or None. This is the full SAT encoding
+    (the part that used to live inside ``_sat_witness``); it lives in a forked
+    child with a memory cap so a runaway UNSAT solve cannot kill the process.
     """
-    if not HAVE_PYCOSAT:
-        return None
-    last = time.time()
-
     def enc(t, vidx):
         if t.val is not None:
             return _TN("v", pos=vidx[t.val])
@@ -415,6 +433,102 @@ def _sat_witness(lhs1, rhs1, lhs2, rhs2, n, eq1_vars, eq2_vars, deadline=float("
             if _eval_term(lhs2, flat, d, n) != _eval_term(rhs2, flat, d, n):
                 return flat
     return None
+
+
+def _sat_witness(lhs1, rhs1, lhs2, rhs2, n, eq1_vars, eq2_vars, deadline=float("inf")):
+    """One size-n magma (flat row-major list) with eq1 universally true & eq2 false, else None.
+
+    ``deadline`` bounds the search: a single UNSAT size can take ~70s, so we bail out
+    if the total elapsed time crosses it. Returns a *flat* list of length n*n.
+
+    Memory guard (pi-hint): the SAT solve can blow past available RAM on a hard
+    UNSAT instance (measured >130GB in one case) and crash the whole process with a
+    bus error / segfault. pycosat.solve is a blocking C call we can't interrupt, so
+    we run it in a forked child with a hard address-space cap. If the child is killed
+    by the OS for exceeding it, we treat the size as "no witness" and move on.
+    """
+    if not HAVE_PYCOSAT:
+        return None
+    if time.time() > deadline:
+        return None
+    # Rough guard: refuse sizes whose clause count would be enormous. This catches
+    # the n^n1/n^n2 blowup before we even fork; the memory cap handles the solver.
+    n1, n2 = len(eq1_vars), len(eq2_vars)
+    est_clauses = (n * n * n) * (n ** n1 + n ** n2) * 2
+    if est_clauses > _SAT_MAX_CLAUSES:
+        return None
+
+    # SAT child -> parent transport uses a temp file, NOT mp.Queue. A forked
+    # child killed mid-write on mp.Queue's background feeder/pipe can corrupt
+    # shared IPC state and crash the PARENT with a native heap error
+    # (``malloc: Double free``); a temp file has no shared state to corrupt.
+    import tempfile
+    ctx = mp.get_context("fork")
+    fd, path = tempfile.mkstemp(prefix="satwit_", dir=_tmpdir())
+    p = ctx.Process(target=_sat_solve_worker, args=(
+        lhs1, rhs1, lhs2, rhs2, n, list(eq1_vars), list(eq2_vars), deadline, path))
+    try:
+        p.start()
+        left = deadline - time.time()
+        p.join(timeout=left if left > 0.25 else 0.25)
+        if p.is_alive():
+            # Still running past the budget (or killed by the memory cap): give up.
+            p.terminate()
+            p.join()
+    finally:
+        try:
+            with os.fdopen(fd, "rb") as f:
+                res = f.read()
+        except Exception:
+            res = b""
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+    if not res:
+        return None
+    try:
+        out = json.loads(res)
+    except Exception:
+        return None
+    if out is None:
+        return None
+    return [int(x) for x in out]
+
+
+def _tmpdir():
+    """Workspace-independent scratch dir for SAT child handoff files."""
+    d = os.path.join(os.environ.get("TMPDIR", "/tmp"), "eqsolve_sat")
+    os.makedirs(d, exist_ok=True)
+    return d
+
+
+def _sat_solve_worker(lhs1, rhs1, lhs2, rhs2, n, eq1_vars, eq2_vars, deadline, path):
+    """Child worker: run the SAT encoding under a hard memory cap and report a witness.
+
+    Sets RLIMIT_AS (the *address space* limit — a previous version passed
+    ``RUSAGE_SELF`` here, which happens to equal ``RLIMIT_CPU`` and silently
+    capped CPU time at ~6 s instead of memory) before calling the blocking
+    pycosat.solve, so a runaway UNSAT solve is killed by the OS rather than
+    taking the parent process down. The witness (or a JSON ``null``) is
+    written to ``path`` for the parent to read.
+    """
+    try:
+        resource.setrlimit(resource.RLIMIT_AS, (_SAT_MEM_CAP, _SAT_MEM_CAP))
+    except Exception:
+        pass
+    result = None
+    try:
+        result = _sat_solve_body(lhs1, rhs1, lhs2, rhs2, n, eq1_vars, eq2_vars, deadline)
+    except MemoryError:
+        result = None
+    except BaseException:
+        result = None
+    try:
+        with open(path, "w") as f:
+            f.write(json.dumps(result))
+    except Exception:
+        pass
 
 
 def emit_false(prob: Problem, n: int, table) -> str:
@@ -787,7 +901,9 @@ def candidates(prob: Problem, budget: float):
     if inst:
         yield "true", wrap_true(inst, prob.vars2, False), "instance"
 
-    r = refute(prob, deadline=t0 + min(30.0, budget * 0.05), sizes=(2, 3))
+    # refutation without SAT (enumeration only): cheap, and TRUE problems
+    # (no small counter-model) skip the otherwise-futile inline SAT fork.
+    r = refute(prob, deadline=t0 + min(30.0, budget * 0.05), sizes=(2, 3), sat=False)
     if r:
         yield "false", emit_false(prob, r[0], r[1]), "refute23"
 
@@ -804,6 +920,21 @@ def candidates(prob: Problem, budget: float):
         if c:
             yield "true", c, "rw_search"
 
+    # Early SAT slice (n=4,5 only) for FALSE problems whose smallest
+    # counter-model is beyond enumeration. Runs BEFORE the long proof search.
+    # The old schedule did exactly this SAT work inline until the end of the
+    # refute23 window, so reusing one equal extension of that window keeps
+    # the TRUE-problem schedule unchanged while giving the slice a real
+    # chance to fire. n=2,3 need no re-check here: refutation above already
+    # covered them (models_of is also cached).
+    left = budget - (time.time() - t0)
+    sat45_end = t0 + 2.0 * min(30.0, budget * 0.05)
+    if left >= min(5.0, budget * 0.4) and time.time() < sat45_end:
+        r = refute(prob, deadline=sat45_end, sizes=(), sat=True,
+                   sat_sizes=(4, 5))
+        if r:
+            yield "false", emit_false(prob, r[0], r[1]), "sat45"
+
     # head_search is capped so it cannot starve the SAT-based refute4 fallback.
     search_deadline = t0 + budget * 0.55
     for beam, depth, size in ((600, 6, 24), (2000, 10, 32), (5000, 14, 40)):
@@ -816,12 +947,13 @@ def candidates(prob: Problem, budget: float):
                 yield "true", c, "search"
             break
 
-    # The SAT refute4 fallback is the only reliable route to many FALSE
-    # problems (e.g. models that only exist at n>=6), so it always gets a
+    # The SAT refute4+ fallback is the only reliable route to many FALSE
+    # problems (models that only exist at n>=6), so it always gets a
     # fair slice of the remaining budget.
     left = budget - (time.time() - t0)
     if left > 5:
-        r = refute(prob, deadline=t0 + budget * 0.95, sizes=(), sample4=200000)
+        r = refute(prob, deadline=t0 + budget * 0.95, sizes=(), sample4=200000,
+                   sat=True, sat_sizes=(4, 6, 7, 8))
         if r:
             yield "false", emit_false(prob, r[0], r[1]), "refute4"
 

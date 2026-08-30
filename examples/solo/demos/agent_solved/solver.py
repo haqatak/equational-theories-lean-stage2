@@ -920,13 +920,16 @@ def candidates(prob: Problem, budget: float):
         if c:
             yield "true", c, "rw_search"
 
-    # Early SAT slice (n=4,5 only) for FALSE problems whose smallest
-    # counter-model is beyond enumeration. Runs BEFORE the long proof search.
-    # The old schedule did exactly this SAT work inline until the end of the
+    # Early SAT slice (n=4,5) for FALSE problems whose smallest counter-model
+    # is beyond enumeration. Runs BEFORE the long proof search. The old
+    # schedule did exactly this SAT work inline until the end of the
     # refute23 window, so reusing one equal extension of that window keeps
     # the TRUE-problem schedule unchanged while giving the slice a real
-    # chance to fire. n=2,3 need no re-check here: refutation above already
-    # covered them (models_of is also cached).
+    # chance to fire. n=6 deliberately lives in the FINAL phase instead:
+    # inside this shared window an UNSAT n=6 starves proven n=4/5 winners
+    # (measured -1 net solve online), while in the final phase its cost is
+    # absorbed by ~40% of the total budget. n=2,3 need no re-check here:
+    # refutation above already covered them (models_of is also cached).
     left = budget - (time.time() - t0)
     sat45_end = t0 + 2.0 * min(30.0, budget * 0.05)
     if left >= min(5.0, budget * 0.4) and time.time() < sat45_end:
@@ -949,11 +952,13 @@ def candidates(prob: Problem, budget: float):
 
     # The SAT refute4+ fallback is the only reliable route to many FALSE
     # problems (models that only exist at n>=6), so it always gets a
-    # fair slice of the remaining budget.
+    # fair slice of the remaining budget. n=6 first: a witness at 6 is
+    # cheap to find (measured <0.5 s) while UNSAT at 6 is expensive, and
+    # the final phase has ~40% of the total budget to absorb that risk.
     left = budget - (time.time() - t0)
     if left > 5:
         r = refute(prob, deadline=t0 + budget * 0.95, sizes=(), sample4=200000,
-                   sat=True, sat_sizes=(4, 6, 7, 8))
+                   sat=True, sat_sizes=(6, 4, 7, 8))
         if r:
             yield "false", emit_false(prob, r[0], r[1]), "refute4"
 

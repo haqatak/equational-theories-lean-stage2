@@ -27,6 +27,7 @@ import json
 import multiprocessing as mp
 import os
 import random
+import re
 import signal
 import sys
 import time
@@ -671,10 +672,24 @@ def emit_false(prob: Problem, n: int, table) -> str:
     if assign is None:
         raise RuntimeError("no witness assignment for eq2")
     args = " ".join(f"E.n{assign[v]}" for v in va)
+    va = first_appearance(prob.lhs2, prob.rhs2)
+    eq2_disp = prob.eq2.replace("*", " ◇ ")
+    assign = None
+    for combo in itertools.product(range(n), repeat=len(va)):
+        a = dict(zip(va, combo))
+        if _eval_term(prob.lhs2, flat, a, n) != _eval_term(prob.rhs2, flat, a, n):
+            assign = a; break
+    if assign is None:
+        raise RuntimeError("no witness assignment for eq2")
+    args = " ".join(f"E.n{assign[v]}" for v in va)
     lines.append(f"theorem rhs_neg : ¬ ∀ ({' '.join(va)} : E), {eq2_disp} := by")
     lines.append("  intro h")
     lines.append(f"  have h1 := h {args}")
-    lines.append("  rw [op_eq] at h1")
+    # rw [op_eq] at h1 only when h1 mentions the magma op: for op-free eq2
+    # (e.g. x = y) the hypothesis is already a bare constructor equation and
+    # ``cases h1`` alone closes it; a vacuous rw fails to compile.
+    if prob.lhs2.val is None or prob.rhs2.val is None:
+        lines.append("  rw [op_eq] at h1")
     lines.append("  cases h1")
     lines.append("")
     lines.append("theorem submission : Goal :=")
@@ -1328,6 +1343,160 @@ def candidates(prob: Problem, budget: float):
 # ══════════════════════════════════════════════════════════════
 # Solo protocol
 # ══════════════════════════════════════════════════════════════
+
+# Top-level PROMPT constant: the proxy extracts this via AST and fills its
+# placeholders ({problem.*}, {history.*}, {solver.*}) before each LLM call.
+# Only those placeholder shapes are filled/stripped, so the literal JSON
+# braces in the examples below survive intact.
+PROMPT = """You are a Lean 4 expert proving implications between equational laws
+of magmas (a set with one binary operation written with the infix symbol).
+
+Hypothesis available in context: equation1 holds, i.e. we have
+  h : ForallVars (EqLHS = EqRHS)
+where EqLHS and EqRHS are the two sides of equation1, and the goal is
+Equation2LHS = Equation2RHS for equation2 in the same magma G.
+
+Your task: decide whether equation1 implies equation2.
+- If TRUE: give a Lean 4 tactic proof using h.
+- If FALSE: produce a finite magma (Cayley table) satisfying equation1 but
+  violating equation2.
+
+Problem:
+  equation1 ({problem.eq1_name}): {problem.equation1}
+  equation2 ({problem.eq2_name}): {problem.equation2}
+
+Previous judge feedback on this problem (may be empty):
+{history.attempts}
+
+Return ONLY a single JSON object, no markdown fences, no commentary:
+  TRUE:  {verdict: true, proof: "..."}
+  FALSE: {verdict: false, n: 5, table: [[...], ...]}
+The proof field: Lean tactic lines only (intro/have/rw/conv/exact/apply/refine/
+simp/cases/constructor/rfl). No 'def submission', no imports, no 'by', no
+'decide'/'native_decide'/'sorry'/'Classical.choice'/'Quot.sound' (banned by the
+judge). Reference the hypothesis as h and instantiate it with explicit terms:
+  have h1 := h a b c
+Tables: row i lists magma outputs for left operand i; cell j is op i j."""
+
+
+def _llm_extract_json(text):
+    """Extract a JSON object from an LLM response; None if unparseable."""
+    text = re.sub(r"</think>[\s\S]*?(?:<think>|$)", "", text)
+    text = re.sub(r"```(?:json)?\s*\n?", "", text).strip()
+    try:
+        return json.loads(text)
+    except Exception:
+        pass
+    m = re.search(r"\{[\s\S]*\}", text)
+    if m:
+        try:
+            return json.loads(m.group())
+        except Exception:
+            return None
+    return None
+
+
+def _llm_true_code(prob, proof_body):
+    """Wrap an LLM proof body in the judge-accepted TRUE certificate shape.
+
+    Returns None if the body is empty or oversized — never wraps unvetted
+    content the judge would waste a round on."""
+    body = str(proof_body or "").strip()
+    if not body:
+        return None
+    if ":= by" in body:
+        body = re.sub(r"^.*?:=\s*by\s*\n?", "", body, count=1, flags=re.DOTALL)
+    body = re.sub(r"^\s*by\s+", "", body)
+    body = re.sub(r"^\s*import\s+.*\n?", "", body, flags=re.MULTILINE)
+    body = re.sub(r"^\s*def\s+submission[^\n]*\n?", "", body,
+                  flags=re.MULTILINE).strip()
+    if not body or len(body) > 40000:
+        return None
+    return wrap_true(body, prob.vars2, False)
+
+
+def _llm_false_code(prob, tbl):
+    """Validate an LLM Cayley table, then wrap it as a FALSE certificate.
+
+    The judge is the authority, but Python-side checking here saves a Lean
+    round on junk tables that violate eq1 or accidentally satisfy eq2.
+    """
+    import itertools as _it
+    try:
+        n = len(tbl)
+        if n < 1 or n > 12 or any(len(r) != n for r in tbl):
+            return None
+        for row in tbl:
+            for cell in row:
+                if not isinstance(cell, int) or not 0 <= cell < n:
+                    return None
+
+        def ev(t, env):
+            if t.val is not None:
+                return env[t.val]
+            return tbl[ev(t.l, env)][ev(t.r, env)]
+
+        vs = sorted(prob.lhs1.vars | prob.rhs1.vars
+                    | prob.lhs2.vars | prob.rhs2.vars)
+        for combo in _it.product(range(n), repeat=len(vs)):
+            env = dict(zip(vs, combo))
+            if ev(prob.lhs1, env) != ev(prob.rhs1, env):
+                return None  # table violates eq1 in Python too
+        if not any(ev(prob.lhs1, dict(zip(vs, c))) == ev(prob.rhs1, dict(zip(vs, c)))
+                   and ev(prob.lhs2, dict(zip(vs, c))) != ev(prob.rhs2, dict(zip(vs, c)))
+                   for c in _it.product(range(n), repeat=len(vs))):
+            return None  # no witnessed violation of eq2
+        return emit_false(prob, n, tbl)
+    except Exception:
+        return None
+
+
+def _llm_round(prob, stdin, stdout, rnd, note):
+    """One LLM round via the proxy protocol.
+
+    Sends {"call":"llm","context":{...}}; the proxy fills the module's PROMPT
+    template ({problem.*}, {history.*}, {solver.*}) and runs the model, so the
+    solver process itself never touches the network (fine inside the
+    network-isolated sandbox). Parses the reply, builds a certificate, and
+    submits it to the judge. Returns True iff accepted."""
+    stdout.write(json.dumps({"call": "llm",
+                             "context": {"round": str(rnd),
+                                         "note": note}}) + "\n")
+    stdout.flush()
+    reply = stdin.readline()
+    if not reply:
+        return False
+    try:
+        result = json.loads(reply)
+    except Exception:
+        return False
+    if not isinstance(result, dict) or "error" in result:
+        return False
+    answer = _llm_extract_json(result.get("response", ""))
+    if not isinstance(answer, dict):
+        return False
+    verdict = answer.get("verdict")
+    if verdict == "true":
+        code = _llm_true_code(prob, answer.get("proof", ""))
+    elif verdict == "false":
+        code = _llm_false_code(prob, answer.get("table")
+                               or answer.get("counterexample_table"))
+    else:
+        code = None
+    if code is None:
+        return False
+    stdout.write(json.dumps({"call": "judge", "verdict": verdict,
+                             "code": code}) + "\n")
+    stdout.flush()
+    jreply = stdin.readline()
+    if not jreply:
+        return False
+    try:
+        return json.loads(jreply).get("status") == "accepted"
+    except Exception:
+        return False
+
+
 def solo(stdin, stdout):
     line = stdin.readline()
     if not line.strip():
@@ -1342,6 +1511,7 @@ def solo(stdin, stdout):
     except Exception:
         return
 
+    t0 = time.time()
     for verdict, code, _head in candidates(prob, budget):
         stdout.write(json.dumps({"call": "judge", "verdict": verdict, "code": code}) + "\n")
         stdout.flush()
@@ -1350,6 +1520,22 @@ def solo(stdin, stdout):
             return
         if json.loads(reply).get("status") == "accepted":
             return
+
+    # ── LLM fallback: only after every deterministic phase failed ──
+    # The proxy performs the actual model call (solver stays network-free, so
+    # this works in both sandbox modes). Rounds are paced by the remaining
+    # wall-clock budget; SAIR_LLM=0 disables the stage entirely for A/B runs.
+    if os.environ.get("SAIR_LLM", "1") != "0":
+        left = budget - (time.time() - t0)
+        if left > 60:
+            rounds = max(1, min(6, int(left // 90)))
+            for rnd in range(rounds):
+                if time.time() > t0 + 0.97 * budget:
+                    break
+                if _llm_round(prob, stdin, stdout, rnd,
+                              "deterministic phases exhausted; residual pair"):
+                    return
+
     # Clear hash-consing caches after each problem to bound memory.
     _clear_term_caches()
 

@@ -910,7 +910,7 @@ def _all_rewrites(prob: Problem, state: Tuple[Term, Term],
     for side_term in (state[0], state[1]):
         for pat, fwd in ((prob.lhs1, True), (prob.rhs1, False)):
             if pat.val is not None:
-                partials = [{pat.val: t} for t in side_term.subterms if t.size == 0]
+                partials = [{pat.val: u} for u in side_term.subterms if u.size == 0]
             else:
                 partials = [e for _g, e in find_redexes(pat, side_term)]
             for base in partials:
@@ -1245,6 +1245,65 @@ def _rule_replay(prob: Problem, rules, path):
 # ══════════════════════════════════════════════════════════════
 # Candidate generation
 # ══════════════════════════════════════════════════════════════
+
+
+def _collapse_head(prob: Problem):
+    """Return (head_var, head_side) if one side of eq1 is a lone variable
+    absent from the other side; (None, None) otherwise.
+
+    head_var absent from the other side ⟹ eq1 equates EVERY element (a = F
+    and b = F for the same F) ⟹ singleton magma. Pure syntax, O(1)."""
+    if prob.lhs1.val is not None and prob.lhs1.val not in prob.rhs1.vars:
+        return prob.lhs1.val, 0
+    if prob.rhs1.val is not None and prob.rhs1.val not in prob.lhs1.vars:
+        return prob.rhs1.val, 1
+    return None, None
+
+
+def collapse_variants(prob: Problem):
+    """Structural singleton detector ('0646 family').
+
+    If one side of eq1 is a lone variable absent from the other side, eq1
+    forces a one-element magma and ANY goal follows in five tactics. Pure
+    syntax; no search, no models. Sound by construction: h is applied twice
+    with IDENTICAL tail fillers, so both instantiated hypotheses mention the
+    identical F-term and a = b follows by transitivity/symmetry alone.
+    Verified judge-accepted on normal_0646 before wiring in."""
+    head_var, side = _collapse_head(prob)
+    if head_var is None:
+        return []
+    if not any(v != head_var for v in prob.vars1):
+        return []  # eq1 is x = x — already handled elsewhere
+    head_idx = prob.vars1.index(head_var)
+    pool = prob.vars2 or ["x"]
+    args1, args2 = [], []
+    fi = 0
+    for v in prob.vars1:
+        if v == head_var:
+            args1.append("a")
+            args2.append("b")
+        else:
+            f = pool[fi % len(pool)]
+            args1.append(f)
+            args2.append(f)
+            fi += 1
+    ta, tb = " ".join(args1), " ".join(args2)
+    # transitivity direction depends on which side the head variable is on:
+    if side == 0:
+        # h1 : a = F(fill), h2 : b = F(fill)  ⇒  a = b via h1.trans h2.symm
+        chain = "    exact h1.trans h2.symm\n"
+    else:
+        # h1 : F = a, h2 : F = b  ⇒  a = b via (h1).symm.trans h2
+        chain = "    exact h1.symm.trans h2\n"
+    body = (
+        "  have sing : ∀ (a b : G), a = b := by\n"
+        "    intro a b\n"
+        "    have h1 := h %s\n"
+        "    have h2 := h %s\n%s"
+        "  exact sing _ _\n") % (ta, tb, chain)
+    return [wrap_true(body, prob.vars2, False)]
+
+
 def candidates(prob: Problem, budget: float):
     """Yield (verdict, code) attempts, cheapest first."""
     t0 = time.time()
@@ -1264,6 +1323,8 @@ def candidates(prob: Problem, budget: float):
 
     # Triviality comes AFTER refutation: if a small model of eq1 breaks eq2
     # the answer is false and no derivation of a = b can exist anyway.
+    for c in collapse_variants(prob):
+        yield "true", c, "collapse"
     for c in trivial_variants(prob, time.time() + min(15.0, budget * 0.03)):
         yield "true", c, "trivial"
     # Clear caches after trivial_variants: head_search with beam=1500 and

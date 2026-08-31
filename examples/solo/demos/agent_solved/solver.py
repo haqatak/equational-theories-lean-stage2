@@ -1233,6 +1233,9 @@ def _rule_replay(prob: Problem, rules, path):
 def candidates(prob: Problem, budget: float):
     """Yield (verdict, code) attempts, cheapest first."""
     t0 = time.time()
+    # Env toggle for controlled experiments (default ON, production behavior):
+    # SAIR_MINING=0 skips the lemma-mining phase entirely.
+    mining_on = os.environ.get("SAIR_MINING", "1") != "0"
 
     inst = head_instance(prob)
     if inst:
@@ -1305,7 +1308,7 @@ def candidates(prob: Problem, budget: float):
     # extra rewrite rules. Only worth trying once the plain search has failed;
     # a FALSE problem pays at most this slice before the SAT refute below runs.
     left = budget - (time.time() - t0)
-    if left > 20:
+    if mining_on and left > 20:
         for c in mined_variants(prob, time.time() + min(25.0, left * 0.10)):
             yield "true", c, "mined"
 
@@ -1357,6 +1360,7 @@ def solo(stdin, stdout):
 def batch(path, limit=0, budget=5.0, show=0):
     import collections
     rows = []
+    noanswer_ids = []
     with open(path) as f:
         for ln in f:
             if ln.strip():
@@ -1384,6 +1388,7 @@ def batch(path, limit=0, budget=5.0, show=0):
         ans = str(p.get("answer", "")).lower()
         if got is None:
             tally["no_answer"] += 1
+            noanswer_ids.append(p["id"])
         elif ans in ("true", "false") and got[0] != ans:
             tally["WRONG/" + got[2]] += 1
             print("WRONG %s via %s: said %s, answer %s\n  eq1: %s\n  eq2: %s"
@@ -1397,6 +1402,10 @@ def batch(path, limit=0, budget=5.0, show=0):
     print("%d problems in %.1fs (%.1fms each)" % (len(rows), dt, dt / max(len(rows), 1) * 1000))
     for k, v in tally.most_common():
         print("  %-16s %d" % (k, v))
+    # List unresolved problem ids so experiments can target them (A/B testing).
+    # Enable with SAIR_LIST_NOANSWER=1.
+    if os.environ.get("SAIR_LIST_NOANSWER") == "1":
+        print("no_answer_ids: " + ",".join(noanswer_ids))
 
 
 if __name__ == "__main__":

@@ -1274,7 +1274,6 @@ def collapse_variants(prob: Problem):
         return []
     if not any(v != head_var for v in prob.vars1):
         return []  # eq1 is x = x — already handled elsewhere
-    head_idx = prob.vars1.index(head_var)
     pool = prob.vars2 or ["x"]
     args1, args2 = [], []
     fi = 0
@@ -1290,10 +1289,8 @@ def collapse_variants(prob: Problem):
     ta, tb = " ".join(args1), " ".join(args2)
     # transitivity direction depends on which side the head variable is on:
     if side == 0:
-        # h1 : a = F(fill), h2 : b = F(fill)  ⇒  a = b via h1.trans h2.symm
         chain = "    exact h1.trans h2.symm\n"
     else:
-        # h1 : F = a, h2 : F = b  ⇒  a = b via (h1).symm.trans h2
         chain = "    exact h1.symm.trans h2\n"
     body = (
         "  have sing : ∀ (a b : G), a = b := by\n"
@@ -1301,6 +1298,67 @@ def collapse_variants(prob: Problem):
         "    have h1 := h %s\n"
         "    have h2 := h %s\n%s"
         "  exact sing _ _\n") % (ta, tb, chain)
+    return [wrap_true(body, prob.vars2, False)]
+
+
+def constant_variants(prob: Problem):
+    """Structural constant-operation detector.
+
+    If one side of eq1 is exactly v1◇v2 (v1 ≠ v2) and {v1, v2} is disjoint
+    from eq1's other side, then two instantiations of h with the SAME tail
+    but different product values give ∀ p q r s : G, p ◇ q = r ◇ s. If both
+    sides of eq2 are compound, the goal is P = Q (products) and closes with
+    'exact hop A B C D'. Sound by construction. The FALSE subcase (an eq2
+    side that is a lone var) stays with refute23 (Fin-2 constant tables).
+    Dual orientation (bare product on eq1's RHS) flips the chain."""
+    def binvar(t: Term) -> bool:
+        return (t.val is None and t.l.val is not None
+                and t.r.val is not None and t.l.val != t.r.val)
+
+    if binvar(prob.lhs1):
+        pv1, pv2, side = prob.lhs1.l.val, prob.lhs1.r.val, 0
+    elif binvar(prob.rhs1):
+        pv1, pv2, side = prob.rhs1.l.val, prob.rhs1.r.val, 1
+    else:
+        return []
+    if prob.lhs1.vars & prob.rhs1.vars:
+        return []  # {v1,v2} must be disjoint from the other side's vars
+    if prob.lhs2.val is not None or prob.rhs2.val is not None:
+        return []  # both E2 sides must be compound
+    # binder positions of the two product variables inside vars1
+    i1 = prob.vars1.index(pv1)
+    i2 = prob.vars1.index(pv2)
+    if i1 == i2:
+        return []
+    pool = prob.vars2 or ["x"]
+    fi = 0
+    pool = prob.vars2 or ["x"]
+    args1, args2 = [], []
+    fi = 0
+    for v in prob.vars1:
+        if v == pv1:
+            a1, a2 = "p", "r"
+        elif v == pv2:
+            a1, a2 = "q", "s"
+        else:
+            f = pool[fi % len(pool)]
+            fi += 1
+            a1 = f
+            a2 = f
+        args1.append(a1)
+        args2.append(a2)
+    ta, tb = " ".join(args1), " ".join(args2)
+    chain = ("    exact h1.trans h2.symm\n" if side == 0
+             else "    exact h1.symm.trans h2\n")
+    body = (
+        "  have hop : ∀ (p q r s : G), p ◇ q = r ◇ s := by\n"
+        "    intro p q r s\n"
+        "    have h1 := h %s\n"
+        "    have h2 := h %s\n%s"
+        "  exact hop %s %s %s %s\n"
+        % (ta, tb, chain,
+           prob.lhs2.l.to_lean(), prob.lhs2.r.to_lean(),
+           prob.rhs2.l.to_lean(), prob.rhs2.r.to_lean()))
     return [wrap_true(body, prob.vars2, False)]
 
 
@@ -1325,6 +1383,8 @@ def candidates(prob: Problem, budget: float):
     # the answer is false and no derivation of a = b can exist anyway.
     for c in collapse_variants(prob):
         yield "true", c, "collapse"
+    for c in constant_variants(prob):
+        yield "true", c, "constant"
     for c in trivial_variants(prob, time.time() + min(15.0, budget * 0.03)):
         yield "true", c, "trivial"
     # Clear caches after trivial_variants: head_search with beam=1500 and

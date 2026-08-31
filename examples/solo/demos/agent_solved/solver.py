@@ -21,6 +21,7 @@ emission shapes before giving up.
 """
 from __future__ import annotations
 
+import gc
 import itertools
 import json
 import multiprocessing as mp
@@ -38,6 +39,24 @@ from typing import Dict, List, Optional, Tuple
 _V_CACHE: Dict[str, "Term"] = {}
 _A_CACHE: Dict[Tuple[int, int], "Term"] = {}
 _UID = itertools.count()
+
+
+def _clear_term_caches():
+    """Clear the hash-consing caches to bound memory across many problems.
+
+    The caches exist to make ``A(l, r)`` return the same object for the same
+    subterms (so ``is`` checks work as structural equality). They are only
+    needed within a single problem's search; clearing them between problems
+    prevents unbounded growth when mining creates millions of transient terms.
+
+    Order matters: ``_REPL`` stores ``Term`` objects that reference subterms
+    in ``_A_CACHE``. Clearing ``_REPL`` first frees those references, then
+    clearing ``_A_CACHE``/``_V_CACHE`` frees the subterms themselves.
+    """
+    _REPL.clear()
+    _A_CACHE.clear()
+    _V_CACHE.clear()
+    gc.collect()
 
 
 class Term:
@@ -138,6 +157,9 @@ def subst(t: Term, env: Dict[str, Term]) -> Term:
 
 
 _REPL: Dict[Tuple[int, int, int], Term] = {}
+_REPL_MAX = 20_000  # bounded cache: each entry holds a Term tree referencing
+                    # subterms in _A_CACHE, so a large bound keeps old subterms
+                    # alive even after _A_CACHE is cleared.
 
 
 def replace_all(t: Term, old: Term, new: Term) -> Term:
@@ -150,6 +172,9 @@ def replace_all(t: Term, old: Term, new: Term) -> Term:
     hit = _REPL.get(k)
     if hit is None:
         hit = _REPL[k] = A(replace_all(t.l, old, new), replace_all(t.r, old, new))
+        # Evict oldest entry when cache exceeds bound to prevent memory blowup.
+        if len(_REPL) > _REPL_MAX:
+            _REPL.pop(next(iter(_REPL)))
     return hit
 
 
@@ -244,10 +269,14 @@ def _make(lhs: Term, rhs: Term, varlist: List[str], n: int, want_witness: bool):
 
 
 _MODELS: Dict[Tuple[str, str, int, int], List[Tuple[int, ...]]] = {}
+_MODELS_MAX = 64  # bounded LRU-ish cache: evict oldest entry when full
 
 
 def models_of(lhs1, rhs1, n, sample=0, cap=600, seed=0, deadline=float("inf")):
-    """Magmas on Fin n satisfying eq1. Cached — repeated eq1 costs nothing."""
+    """Magmas on Fin n satisfying eq1. Cached — repeated eq1 costs nothing.
+
+    The cache is bounded to ``_MODELS_MAX`` entries to prevent unbounded
+    memory growth across thousands of problems."""
     key = (str(lhs1), str(rhs1), n, sample)
     hit = _MODELS.get(key)
     if hit is not None:
@@ -275,6 +304,8 @@ def models_of(lhs1, rhs1, n, sample=0, cap=600, seed=0, deadline=float("inf")):
                 out.append(T)
                 if len(out) >= cap:
                     break
+    if len(_MODELS) >= _MODELS_MAX:
+        _MODELS.pop(next(iter(_MODELS)))  # evict oldest
     _MODELS[key] = out
     return out
 
@@ -334,6 +365,7 @@ class _TN:
 
 
 _SAT_MAX_CLAUSES = 2_000_000  # rough clause-count guard (see _sat_witness)
+_CONJECTURE_CAP = 30  # max conjectures to attempt proving per problem
 # Hard address-space cap (bytes) for the forked SAT child. pycosat.solve is a
 # blocking C call that can run away to >130GB on a hard UNSAT instance and crash
 # the whole process with a bus error/segfault. We cannot interrupt it from Python,
@@ -462,29 +494,48 @@ def _sat_witness(lhs1, rhs1, lhs2, rhs2, n, eq1_vars, eq2_vars, deadline=float("
     # child killed mid-write on mp.Queue's background feeder/pipe can corrupt
     # shared IPC state and crash the PARENT with a native heap error
     # (``malloc: Double free``); a temp file has no shared state to corrupt.
-    import tempfile
-    ctx = mp.get_context("fork")
+    #
+    # We use subprocess (not fork) so the child is a fully separate process:
+    # fork's copy-on-write means the child's memory is accounted to the parent's
+    # RSS, which made the parent appear to use 16-360GB. subprocess gives the
+    # child its own address space, so the parent's RSS stays bounded.
+    import tempfile, subprocess
     fd, path = tempfile.mkstemp(prefix="satwit_", dir=_tmpdir())
-    p = ctx.Process(target=_sat_solve_worker, args=(
-        lhs1, rhs1, lhs2, rhs2, n, list(eq1_vars), list(eq2_vars), deadline, path))
+    os.close(fd)
+    # Serialize the problem to a JSON file the child reads (avoids argv limits).
+    prob_path = path + ".prob"
+    with open(prob_path, "w") as f:
+        json.dump({"lhs1": str(lhs1), "rhs1": str(rhs1), "lhs2": str(lhs2),
+                   "rhs2": str(rhs2), "n": n, "eq1_vars": list(eq1_vars),
+                   "eq2_vars": list(eq2_vars), "deadline": deadline,
+                   "out": path}, f)
     try:
-        p.start()
-        left = deadline - time.time()
-        p.join(timeout=left if left > 0.25 else 0.25)
-        if p.is_alive():
-            # Still running past the budget (or killed by the memory cap): give up.
-            p.terminate()
-            p.join()
+        proc = subprocess.run(
+            [sys.executable, "-B", "-c",
+             "import sys; sys.path.insert(0, %r); "
+             "from solver import _sat_solve_worker_main; "
+             "_sat_solve_worker_main(%r)" % (
+                 os.path.dirname(os.path.abspath(__file__)), prob_path)],
+            timeout=max(deadline - time.time(), 1.0),
+            capture_output=True)
+    except subprocess.TimeoutExpired:
+        pass
+    except Exception:
+        pass
     finally:
         try:
-            with os.fdopen(fd, "rb") as f:
-                res = f.read()
-        except Exception:
-            res = b""
-        try:
-            os.unlink(path)
+            os.unlink(prob_path)
         except OSError:
             pass
+    try:
+        with open(path, "rb") as f:
+            res = f.read()
+    except Exception:
+        res = b""
+    try:
+        os.unlink(path)
+    except OSError:
+        pass
     if not res:
         return None
     try:
@@ -526,6 +577,44 @@ def _sat_solve_worker(lhs1, rhs1, lhs2, rhs2, n, eq1_vars, eq2_vars, deadline, p
         result = None
     try:
         with open(path, "w") as f:
+            f.write(json.dumps(result))
+    except Exception:
+        pass
+
+
+def _sat_solve_worker_main(prob_path):
+    """Entry point for the subprocess SAT worker.
+
+    Reads the problem from ``prob_path`` (JSON), sets a memory cap, runs the
+    SAT encoding, and writes the witness to the output path. This is a
+    standalone function so it can be invoked via ``python -c`` in a separate
+    process (avoiding fork's copy-on-write memory accounting).
+    """
+    try:
+        resource.setrlimit(resource.RLIMIT_AS, (_SAT_MEM_CAP, _SAT_MEM_CAP))
+    except Exception:
+        pass
+    with open(prob_path) as f:
+        spec = json.load(f)
+    lhs1 = parse(spec["lhs1"])
+    rhs1 = parse(spec["rhs1"])
+    lhs2 = parse(spec["lhs2"])
+    rhs2 = parse(spec["rhs2"])
+    n = spec["n"]
+    eq1_vars = spec["eq1_vars"]
+    eq2_vars = spec["eq2_vars"]
+    deadline = spec["deadline"]
+    out_path = spec["out"]
+    result = None
+    try:
+        result = _sat_solve_body(lhs1, rhs1, lhs2, rhs2, n, eq1_vars, eq2_vars,
+                                 deadline)
+    except MemoryError:
+        result = None
+    except BaseException:
+        result = None
+    try:
+        with open(out_path, "w") as f:
             f.write(json.dumps(result))
     except Exception:
         pass
@@ -891,6 +980,254 @@ def rw_search_emit(prob: Problem, deadline: float) -> Optional[str]:
 
 
 # ══════════════════════════════════════════════════════════════
+# Lemma mining — manufacture TRUE-side ammunition from FALSE-side machinery
+# ══════════════════════════════════════════════════════════════
+# Every magma of size 2 or 3 satisfying eq1 can be enumerated (see
+# ``models_of``). An identity that fails in one of them is therefore *not* a
+# theorem of eq1, while one that survives all of them is a conjecture worth
+# trying: proving it turns it into a rewrite rule the goal search may use.
+# This is the classic UT/Argonne move — finite models refute candidates cheaply,
+# and the survivors are proved by the ordinary (sound) search, so nothing here
+# ever trusts an unproved identity.
+def _fresh_names(used: List[str], k: int) -> List[str]:
+    out = []
+    for ch in "uvwxyztq":
+        if ch not in used and len(out) < k:
+            out.append(ch)
+    return out
+
+
+def _idioms(max_size: int, names: List[str]) -> List[Term]:
+    """Every term over ``names`` with 2 <= size <= max_size."""
+    vs = [V(n) for n in names]
+    out = list(vs)
+    seen = {str(t) for t in out}
+    while True:
+        nxt = []
+        for a in out:
+            for b in out:
+                t = A(a, b)
+                if t.size <= max_size and str(t) not in seen:
+                    seen.add(str(t))
+                    nxt.append(t)
+        if not nxt:
+            break
+        out += nxt
+    return [t for t in out if t.size >= 2]
+
+
+def mine_conjectures(prob: Problem, deadline: float, names: List[str],
+                     max_size: int = 4, cap: int = 40):
+    """Identities over ``names`` valid in every small model of eq1.
+
+    Returns [] when no small model is known (nothing can be filtered out then).
+    Bounded to ``_CONJECTURE_CAP`` results to limit downstream proof attempts."""
+    ms = []
+    for n in (2, 3):
+        ms += [(T, n) for T in models_of(prob.lhs1, prob.rhs1, n, cap=cap,
+                                         deadline=deadline)]
+    if not ms:
+        return []
+    cands = _idioms(max_size, names)
+    out = []
+    for i, s in enumerate(cands):
+        if time.time() > deadline or len(out) >= _CONJECTURE_CAP:
+            break
+        for t in cands[i + 1:]:
+            if time.time() > deadline or len(out) >= _CONJECTURE_CAP:
+                break
+            ok = True
+            for T, n in ms:
+                for combo in itertools.product(range(n), repeat=len(names)):
+                    a = dict(zip(names, combo))
+                    if _eval_term(s, T, a, n) != _eval_term(t, T, a, n):
+                        ok = False
+                        break
+                if not ok:
+                    break
+            if ok:
+                out.append((s, t))
+    out.sort(key=lambda st: st[0].size + st[1].size)
+    return out
+
+
+def _lemma_proof(prob: Problem, s: Term, t: Term, names: List[str],
+                 deadline: float, name: str):
+    """Prove ``s = t`` from eq1 with head_search; return a ``have`` block.
+
+    The block proves ``∀ (u v : G), s = t`` in the context already introduced
+    by ``wrap_true``, so it may use only the outer hypothesis ``h``."""
+    sub = Problem(prob.pid + "#lem", "%s=%s" % (prob.lhs1, prob.rhs1),
+                  "%s=%s" % (s, t), prob.eq1_id, 0)
+    ok_names = set(names)
+    for beam, depth, size in ((200, 5, 20), (800, 7, 26)):
+        if time.time() > deadline:
+            return None
+        path = head_search(sub, deadline, beam, depth, size)
+        if path:
+            # head_search builds step arguments from the lemma goal's own
+            # variables, so every argument is a term over `names` and stays in
+            # scope inside the `have` block below. Assert rather than trust.
+            if any(a.vars - ok_names for st in path for a in st.args):
+                return None
+            body = "".join("        %s\n" % st.tactic() for st in path)
+            return ("  have %s : ∀ (%s : G), %s = %s := by\n"
+                    "      intro %s\n%s      rfl\n"
+                    % (name, " ".join(names), s.to_lean(), t.to_lean(),
+                       " ".join(names), body))
+    return None
+
+
+_RULE_REWRITE_CAP = 400  # max rewrites per (state, rule) to bound memory
+
+
+def _rule_rewrites(rules, state, pool, max_size):
+    """All (ri, args, old, new, fwd, side) rewrites of the goal pair by rules.
+
+    Bounded by ``_RULE_REWRITE_CAP`` to prevent memory blowup on large pools."""
+    out, seen = [], set()
+    for ri, (lhs, rhs, rvars) in enumerate(rules):
+        for ix in (0, 1):
+            side = state[ix]
+            for pat, repl, fwd in ((lhs, rhs, True), (rhs, lhs, False)):
+                if pat.val is not None:
+                    bases = [{pat.val: u} for u in side.subterms if u.size == 0]
+                else:
+                    bases = [e for _g, e in find_redexes(pat, side)]
+                for base in bases:
+                    unbound = [v for v in rvars if v not in base]
+                    if len(unbound) > 3:
+                        continue
+                    for combo in itertools.product(pool, repeat=len(unbound)):
+                        env = dict(base)
+                        env.update(zip(unbound, combo))
+                        old, new = (subst(lhs, env), subst(rhs, env)) if fwd \
+                            else (subst(rhs, env), subst(lhs, env))
+                        if old is new or old.size > max_size or new.size > max_size:
+                            continue
+                        key = (ri, str(old), str(new))
+                        if key in seen:
+                            continue
+                        seen.add(key)
+                        out.append((ri, tuple(env[v] for v in rvars), old, new,
+                                    fwd, ix))
+                        if len(out) >= _RULE_REWRITE_CAP:
+                            return out
+    return out
+
+
+def _rule_search(prob: Problem, rules, deadline, beam=400, max_depth=6,
+                 max_size=24):
+    """Beam search over the goal pair using eq1 *and* proven lemmas.
+
+    Steps are one-sided (``conv_lhs``/``conv_rhs``), so a closed path replays
+    exactly like ``head_search``'s and emits with the same tactic shapes.
+
+    Memory: uses parent pointers instead of copying full paths at each step,
+    and bounds the visited set to ``beam * max_depth`` entries."""
+    start = (prob.lhs2, prob.rhs2)
+    if start[0] is start[1]:
+        return []
+    pool = [V(v) for v in prob.vars2][:4] or [V("x")]
+    # parent: state -> (parent_state, step)  — avoids copying path lists
+    parent = {start: None}
+    frontier = [start]
+    for _ in range(max_depth):
+        if time.time() > deadline:
+            break
+        scored = []
+        for state in frontier:
+            if time.time() > deadline:
+                break
+            for ri, args, old, new, fwd, ix in _rule_rewrites(rules, state, pool,
+                                                              max_size):
+                side = state[ix]
+                ns_side = replace_all(side, old, new)
+                if ns_side is side:
+                    continue
+                ns = (ns_side, state[1]) if ix == 0 else (state[0], ns_side)
+                if ns in parent or ns[0].size > max_size or ns[1].size > max_size:
+                    continue
+                parent[ns] = (state, (ri, args, fwd, ix))
+                if ns[0] is ns[1]:
+                    # Reconstruct path from parent pointers
+                    path = []
+                    cur = ns
+                    while parent[cur] is not None:
+                        pstate, step = parent[cur]
+                        path.append(step)
+                        cur = pstate
+                    path.reverse()
+                    return path
+                scored.append((mismatch(ns[0], ns[1])
+                               + (ns[0].size + ns[1].size) // 2, ns))
+        if not scored:
+            break
+        scored.sort(key=lambda x: x[0])
+        frontier = [s for _h, s in scored[:beam]]
+    return None
+
+
+def mined_variants(prob: Problem, deadline: float, max_lemmas: int = 6):
+    """Prove small model-filtered identities, then retry the goal with them.
+
+    Yields candidate TRUE certificates (each self-contained and judge-checkable).
+    Nothing unsound can escape: a lemma is used only after ``head_search``
+    produced a replay-verified derivation of it from ``h``, and the goal path is
+    replayed by ``_rule_replay`` before emission."""
+    used = list(prob.vars2) + list(prob.vars1) + ["G", "h"]
+    names = _fresh_names(used, 2)
+    if len(names) < 2:
+        return
+    conj = mine_conjectures(prob, min(deadline, time.time() + 20.0), names)
+    if not conj:
+        return
+    rules = [(prob.lhs1, prob.rhs1, prob.vars1)]
+    blocks = []
+    for (s, t) in conj:
+        if len(blocks) >= max_lemmas or time.time() > deadline:
+            break
+        body = _lemma_proof(prob, s, t, names, deadline, "l%d" % len(blocks))
+        if body is None:
+            continue
+        blocks.append(body)
+        rules.append((s, t, list(names)))
+        # Clear transient terms created during lemma proof to bound memory.
+        _clear_term_caches()
+    if not blocks:
+        return
+    path = _rule_search(prob, rules, deadline)
+    if not path:
+        return
+    if _rule_replay(prob, rules, path) is None:
+        return
+    body = "".join(blocks)
+    for (ri, args, fwd, ix) in path:
+        a = " ".join(x.to_lean() for x in args)
+        ref = "h %s" % a if ri == 0 else "l%d %s" % (ri - 1, a)
+        body += ("  conv_%s => rw [%s%s]\n"
+                 % ("lhs" if ix == 0 else "rhs", "" if fwd else "← ", ref))
+    yield wrap_true(body, prob.vars2, True)
+
+
+def _rule_replay(prob: Problem, rules, path):
+    state = (prob.lhs2, prob.rhs2)
+    for (ri, args, fwd, ix) in path:
+        lhs, rhs, rvars = rules[ri]
+        env = dict(zip(rvars, args))
+        old, new = (subst(lhs, env), subst(rhs, env)) if fwd \
+            else (subst(rhs, env), subst(lhs, env))
+        if old is new:
+            return None
+        side = state[ix]
+        ns = replace_all(side, old, new)
+        if ns is side:
+            return None
+        state = (ns, state[1]) if ix == 0 else (state[0], ns)
+    return path if state[0] is state[1] else None
+
+
+# ══════════════════════════════════════════════════════════════
 # Candidate generation
 # ══════════════════════════════════════════════════════════════
 def candidates(prob: Problem, budget: float):
@@ -911,6 +1248,9 @@ def candidates(prob: Problem, budget: float):
     # the answer is false and no derivation of a = b can exist anyway.
     for c in trivial_variants(prob, time.time() + min(15.0, budget * 0.03)):
         yield "true", c, "trivial"
+    # Clear caches after trivial_variants: head_search with beam=1500 and
+    # max_depth=8 can create a large visited set of Term objects.
+    _clear_term_caches()
 
     # Whole-goal rw search on the real goal pair (lhs2, rhs2).
     # Uses only in-scope variables, so the emitted ``have`` refs are valid.
@@ -919,6 +1259,9 @@ def candidates(prob: Problem, budget: float):
         c = rw_search_emit(prob, time.time() + min(left * 0.2, 30.0))
         if c:
             yield "true", c, "rw_search"
+        # rw_search with beam=2000 and max_depth=16 creates a large visited
+        # set of Term objects; clear caches to prevent accumulation.
+        _clear_term_caches()
 
     # Early SAT slice (n=4,5) for FALSE problems whose smallest counter-model
     # is beyond enumeration. Runs BEFORE the long proof search. The old
@@ -937,6 +1280,8 @@ def candidates(prob: Problem, budget: float):
                    sat_sizes=(4, 5))
         if r:
             yield "false", emit_false(prob, r[0], r[1]), "sat45"
+        # Clear caches after SAT phase to free any transient terms.
+        _clear_term_caches()
 
     # head_search is capped so it cannot starve the SAT-based refute4 fallback.
     search_deadline = t0 + budget * 0.55
@@ -949,6 +1294,20 @@ def candidates(prob: Problem, budget: float):
             for c in true_variants(prob, path):
                 yield "true", c, "search"
             break
+        # Clear caches between search iterations: head_search with beam=600
+        # and max_depth=6 can create millions of transient Term objects in
+        # _A_CACHE/_REPL. Without clearing, they accumulate across iterations
+        # and across problems, causing the 360GB memory explosion.
+        _clear_term_caches()
+
+    # Lemma mining: enumerate the small models of eq1, keep the identities they
+    # do NOT refute, prove the survivors from h, and retry the goal with them as
+    # extra rewrite rules. Only worth trying once the plain search has failed;
+    # a FALSE problem pays at most this slice before the SAT refute below runs.
+    left = budget - (time.time() - t0)
+    if left > 20:
+        for c in mined_variants(prob, time.time() + min(25.0, left * 0.10)):
+            yield "true", c, "mined"
 
     # The SAT refute4+ fallback is the only reliable route to many FALSE
     # problems (models that only exist at n>=6), so it always gets a
@@ -988,6 +1347,8 @@ def solo(stdin, stdout):
             return
         if json.loads(reply).get("status") == "accepted":
             return
+    # Clear hash-consing caches after each problem to bound memory.
+    _clear_term_caches()
 
 
 # ══════════════════════════════════════════════════════════════
@@ -1016,6 +1377,10 @@ def batch(path, limit=0, budget=5.0, show=0):
         for verdict, code, head in candidates(prob, budget):
             got = (verdict, code, head)
             break
+        # Clear hash-consing caches between problems to bound memory: the
+        # mining phase can create millions of transient Term objects that
+        # would otherwise accumulate across the full problem set.
+        _clear_term_caches()
         ans = str(p.get("answer", "")).lower()
         if got is None:
             tally["no_answer"] += 1

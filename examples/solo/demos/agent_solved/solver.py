@@ -1627,9 +1627,16 @@ def candidates(prob: Problem, budget: float):
     # fair slice of the remaining budget. n=6 first: a witness at 6 is
     # cheap to find (measured <0.5 s) while UNSAT at 6 is expensive, and
     # the final phase has ~40% of the total budget to absorb that risk.
+    # Deadline is 0.80·budget (was 0.95): the LLM fallback needs real room
+    # after the deterministic phases — at 3600s the old schedule left only
+    # ~2 rounds (~50 min of which was dead UNSAT search before the model
+    # ever saw a TRUE residual); 0.80 leaves 4+ rounds. FALSE problems are
+    # unaffected: witnesses at n=6 are found in seconds, and an UNSAT size
+    # that would have been found in the 0.80–0.95 window is a rare loss
+    # against the LLM's independent chance on the same problem.
     left = budget - (time.time() - t0)
     if left > 5:
-        r = refute(prob, deadline=t0 + budget * 0.95, sizes=(), sample4=200000,
+        r = refute(prob, deadline=t0 + budget * 0.80, sizes=(), sample4=200000,
                    sat=True, sat_sizes=(6, 4, 7, 8))
         if r:
             yield "false", emit_false(prob, r[0], r[1]), "refute4"
@@ -1643,52 +1650,68 @@ def candidates(prob: Problem, budget: float):
 # placeholders ({problem.*}, {history.*}, {solver.*}) before each LLM call.
 # Only those placeholder shapes are filled/stripped, so the literal JSON
 # braces in the examples below survive intact.
-PROMPT = """You are a Lean 4 expert proving implications between equational laws
-of magmas (a set with one binary operation written with the infix symbol).
+PROMPT = """Return exactly one JSON object. No markdown. No analysis. No fences.
+First character must be `{`. Last character must be `}`.
 
-Hypothesis available in context: equation1 holds, i.e. we have
-  h : ForallVars (EqLHS = EqRHS)
-where EqLHS and EqRHS are the two sides of equation1, and the goal is
-Equation2LHS = Equation2RHS for equation2 in the same magma G.
+TRUE:  {"verdict":"true","proof":"intro x y\\nhave h1 := h x y x\\nexact h1.trans h1"}
+FALSE: {"verdict":"false","n":2,"table":[[0,0],[1,1]]}
 
-Your task: decide whether equation1 implies equation2.
-- If TRUE: give a Lean 4 tactic proof using h.
-- If FALSE: produce a finite magma (Cayley table) satisfying equation1 but
-  violating equation2.
+Example A (collapse TRUE). H: x = y\u25c7z    Goal: a = b
+{"verdict":"true","proof":"intro a b\\nhave h1 := h a a a\\nhave h2 := h b a a\\nexact h1.trans h2.symm"}
 
-Problem:
-  equation1 ({problem.eq1_name}): {problem.equation1}
-  equation2 ({problem.eq2_name}): {problem.equation2}
+Example B (left proj FALSE). H preserves leftmost leaf, Goal does not
+{"verdict":"false","n":2,"table":[[0,0],[1,1]]}
 
-Previous judge feedback on this problem (may be empty):
+Example C (instance TRUE). Goal is H with vars identified
+{"verdict":"true","proof":"intro x y\\nexact h x y x"}
+
+Problem
+  H    ({problem.eq1_name}): {problem.equation1}
+  Goal ({problem.eq2_name}): {problem.equation2}
+h-binders = first-appearance order of letters in H.
+Op symbol is \u25c7 only.
+
+Judge history:
 {history.attempts}
 
-Return ONLY a single JSON object, no markdown fences, no commentary:
-  TRUE:  {verdict: true, proof: "..."}
-  FALSE: {verdict: false, n: 5, table: [[...], ...]}
-The proof field: Lean tactic lines only (intro/have/rw/conv/exact/apply/refine/
-simp/cases/constructor/rfl). No 'def submission', no imports, no 'by', no
-'decide'/'native_decide'/'sorry'/'Classical.choice'/'Quot.sound' (banned by the
-judge). Reference the hypothesis as h and instantiate it with explicit terms:
-  have h1 := h a b c
-Tables: row i lists magma outputs for left operand i; cell j is op i j."""
+If H is x = F(...) or F(...) = x with x absent from F: TRUE, singleton via two h apps + trans.
+If H is v1\u25c7v2 = F with {v1,v2} disjoint from F and both Goal sides compound: TRUE, hop p q r s.
+If Goal is a substitution instance of H: TRUE, exact h ...
+If leftmost leaves of H match and Goal's do not: FALSE, table [[0,0],[1,1]].
+If rightmost leaves of H match and Goal's do not: FALSE, table [[0,1],[0,1]].
+Else try n=2 constant [[0,0],[0,0]], then min/max, then (i+j) mod 2 or 3.
+TRUE tactics only: intro have rw exact rfl trans symm calc congr nth_rewrite conv.
+Forbidden: grind decide native_decide sorry axiom ZMod Classical markdown.
+
+Proof field = tactic lines only. No def submission, no import, no by.
+Instantiate h with explicit parenthesized terms: have h1 := h a (b \u25c7 b) c
+FALSE table[i][j] = i\u25c7j, entries in 0..n-1, verify H holds on every assignment.
+
+Repair from history: unknown identifier -> only use intro'd names; h type mismatch -> wrong binder order; unsolved after rw -> name sides with have hL / have hR; incomplete_proof -> you used grind, delete it; H failed on a table -> change family, do not patch one cell.
+
+Output again: one JSON object, nothing else.
+{"verdict":"true","proof":"..."} or {"verdict":"false","n":2,"table":[[0,1],[0,1]]}
+"""
 
 
 def _llm_extract_json(text):
-    """Extract a JSON object from an LLM response; None if unparseable."""
-    text = re.sub(r"</think>[\s\S]*?(?:<think>|$)", "", text)
-    text = re.sub(r"```(?:json)?\s*\n?", "", text).strip()
+    """Extract a JSON object from an LLM response; None if unparseable.
+
+    Tolerant: strips markdown fences, then takes first '{' to last '}'.
+    Gemma narrates in markdown when the prompt reads like an essay; the
+    narration itself contains no JSON, but a trailing object after prose
+    must still be found."""
+    text = text.strip()
+    if text.startswith("```"):
+        text = text.strip("`")
+        text = text.split("\n", 1)[-1]
+    i, j = text.find("{"), text.rfind("}")
+    if i < 0 or j <= i:
+        return None
     try:
-        return json.loads(text)
+        return json.loads(text[i:j + 1])
     except Exception:
-        pass
-    m = re.search(r"\{[\s\S]*\}", text)
-    if m:
-        try:
-            return json.loads(m.group())
-        except Exception:
-            return None
-    return None
+        return None
 
 
 def _llm_true_code(prob, proof_body):
@@ -1746,30 +1769,35 @@ def _llm_false_code(prob, tbl):
         return None
 
 
-def _llm_round(prob, stdin, stdout, rnd, note):
+def _llm_round(prob, stdin, stdout, rnd, note, repair=False):
     """One LLM round via the proxy protocol.
 
     Sends {"call":"llm","context":{...}}; the proxy fills the module's PROMPT
     template ({problem.*}, {history.*}, {solver.*}) and runs the model, so the
     solver process itself never touches the network (fine inside the
     network-isolated sandbox). Parses the reply, builds a certificate, and
-    submits it to the judge. Returns True iff accepted."""
+    submits it to the judge.
+
+    Returns "accepted" | "rejected" | "unparseable" | "no_reply".
+    "unparseable" means the model narrated instead of emitting JSON — the
+    caller sends ONE short repair request, never the full strategy essay
+    (long context is what caused the narration in the first place)."""
     stdout.write(json.dumps({"call": "llm",
                              "context": {"round": str(rnd),
                                          "note": note}}) + "\n")
     stdout.flush()
     reply = stdin.readline()
     if not reply:
-        return False
+        return "no_reply"
     try:
         result = json.loads(reply)
     except Exception:
-        return False
+        return "no_reply"
     if not isinstance(result, dict) or "error" in result:
-        return False
+        return "llm_error"
     answer = _llm_extract_json(result.get("response", ""))
     if not isinstance(answer, dict):
-        return False
+        return "unparseable"
     verdict = answer.get("verdict")
     if verdict == "true":
         code = _llm_true_code(prob, answer.get("proof", ""))
@@ -1779,17 +1807,19 @@ def _llm_round(prob, stdin, stdout, rnd, note):
     else:
         code = None
     if code is None:
-        return False
+        return "bad_cert"
     stdout.write(json.dumps({"call": "judge", "verdict": verdict,
                              "code": code}) + "\n")
     stdout.flush()
     jreply = stdin.readline()
     if not jreply:
-        return False
+        return "no_reply"
     try:
-        return json.loads(jreply).get("status") == "accepted"
+        return ("accepted"
+                if json.loads(jreply).get("status") == "accepted"
+                else "rejected")
     except Exception:
-        return False
+        return "no_reply"
 
 
 def solo(stdin, stdout):
@@ -1823,13 +1853,22 @@ def solo(stdin, stdout):
     if os.environ.get("SAIR_LLM", "1") != "0":
         left = budget - (time.time() - t0)
         if left > 60:
-            rounds = max(1, min(6, int(left // 90)))
-            for rnd in range(rounds):
+            # Cap at 2 rounds: a timeout on round 2 is a no_answer, not a
+            # third prompt. Long context is what made the model narrate.
+            for rnd in range(2):
                 if time.time() > t0 + 0.97 * budget:
                     break
-                if _llm_round(prob, stdin, stdout, rnd,
-                              "deterministic phases exhausted; residual pair"):
+                st = _llm_round(prob, stdin, stdout, rnd,
+                                "deterministic phases exhausted; residual pair")
+                if st == "accepted":
                     return
+                if st == "unparseable":
+                    # One repair call: format nudge only, no strategy essay.
+                    if _llm_round(prob, stdin, stdout, rnd,
+                                  "REPAIR: your last reply was not JSON. "
+                                  "Reply with a single object, first char { "
+                                  "last char }."):
+                        return
 
     # Clear hash-consing caches after each problem to bound memory.
     _clear_term_caches()
